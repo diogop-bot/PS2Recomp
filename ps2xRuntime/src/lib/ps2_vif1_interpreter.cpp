@@ -30,16 +30,29 @@ namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
 
-    uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
+    // An IMAGE GIFtag at the end of a PATH2 payload whose data runs past the payload.
+    struct TrailingImage
+    {
+        uint32_t tagOffset = 0u; // byte offset of the GIFtag in the payload
+        uint32_t presentQw = 0u; // image qwords that follow it in this payload
+        uint32_t missingQw = 0u; // image qwords still to come
+        uint64_t tagLo = 0u;
+        uint64_t tagHi = 0u;
+    };
+
+    bool findTrailingIncompleteImage(const uint8_t *data, uint32_t sizeBytes, TrailingImage &out)
     {
         if (!data || sizeBytes < 16u)
-            return 0u;
+            return false;
 
         uint32_t offset = 0u;
         while (offset + 16u <= sizeBytes)
         {
             uint64_t tagLo = 0u;
+            uint64_t tagHi = 0u;
             std::memcpy(&tagLo, data + offset, sizeof(tagLo));
+            std::memcpy(&tagHi, data + offset + 8u, sizeof(tagHi));
+            const uint32_t tagOffset = offset;
             offset += 16u;
 
             const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
@@ -64,20 +77,32 @@ namespace
                 const uint64_t availableBytes = sizeBytes - offset;
                 if (payloadBytes > availableBytes)
                 {
-                    return static_cast<uint32_t>((payloadBytes - availableBytes) / 16ull);
+                    out.tagOffset = tagOffset;
+                    out.presentQw = static_cast<uint32_t>(availableBytes / 16ull);
+                    out.missingQw = nloop - out.presentQw;
+                    out.tagLo = tagLo;
+                    out.tagHi = tagHi;
+                    return true;
                 }
-            }
-            else
-            {
-                return 0u;
             }
 
             if (payloadBytes > static_cast<uint64_t>(sizeBytes - offset))
-                return 0u;
+                return false;
             offset += static_cast<uint32_t>(payloadBytes);
         }
 
-        return 0u;
+        return false;
+    }
+
+    // IMAGE GIFtag + qwc qwords of data as one self-contained packet; NLOOP and EOP replaced.
+    std::vector<uint8_t> makeImagePacket(uint64_t tagLo, uint64_t tagHi, uint32_t qwc, bool eop, const uint8_t *data)
+    {
+        std::vector<uint8_t> packet(16u + static_cast<size_t>(qwc) * 16u);
+        tagLo = (tagLo & ~0xFFFFull) | (qwc & 0x7FFFu) | (eop ? 0x8000ull : 0ull);
+        std::memcpy(packet.data(), &tagLo, sizeof(tagLo));
+        std::memcpy(packet.data() + 8u, &tagHi, sizeof(tagHi));
+        std::memcpy(packet.data() + 16u, data, static_cast<size_t>(qwc) * 16u);
+        return packet;
     }
 }
 
@@ -295,6 +320,55 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+// Games commonly upload textures over PATH2 as two VIF commands: a DIRECT whose payload ends
+// with an IMAGE GIFtag, then (often behind a new DMAtag) a DIRECT whose payload is the pixels.
+// The GIF keeps PATH2's IMAGE state across the two; here the image data is taken from the next
+// DIRECT payload (never from the VIF stream between them) and each piece is sent as a
+// self-contained IMAGE packet, which also matches what a stateful GS sees on hardware.
+void PS2Memory::submitVif1DirectPayload(const uint8_t *data, uint32_t sizeBytes, bool directHl)
+{
+    uint32_t pos = 0u;
+
+    if (m_vif1PendingPath2ImageQwc != 0u)
+    {
+        const uint32_t qwc = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, sizeBytes / 16u);
+        if (qwc == 0u)
+            return;
+        m_vif1PendingPath2ImageQwc -= qwc;
+        const bool last = (m_vif1PendingPath2ImageQwc == 0u);
+        const bool eop = last && (m_vif1PendingPath2ImageTag & 0x8000ull) != 0ull;
+        const std::vector<uint8_t> packet = makeImagePacket(m_vif1PendingPath2ImageTag, 0ull, qwc, eop, data);
+        submitGifPacket(GifPathId::Path2, packet.data(), static_cast<uint32_t>(packet.size()), true, directHl);
+        pos = qwc * 16u;
+        if (last)
+            m_vif1PendingPath2DirectHl = false;
+    }
+
+    if (pos + 16u > sizeBytes)
+        return;
+
+    TrailingImage trailing;
+    if (!findTrailingIncompleteImage(data + pos, sizeBytes - pos, trailing))
+    {
+        submitGifPacket(GifPathId::Path2, data + pos, sizeBytes - pos, true, directHl);
+        return;
+    }
+
+    // Hold back the IMAGE tag whose data is incomplete: everything before it, and the part of
+    // its data that is already here, go out now; the rest follows with the next DIRECT.
+    if (trailing.tagOffset != 0u)
+        submitGifPacket(GifPathId::Path2, data + pos, trailing.tagOffset, true, directHl);
+    if (trailing.presentQw != 0u)
+    {
+        const std::vector<uint8_t> packet = makeImagePacket(trailing.tagLo, trailing.tagHi, trailing.presentQw, false,
+                                                            data + pos + trailing.tagOffset + 16u);
+        submitGifPacket(GifPathId::Path2, packet.data(), static_cast<uint32_t>(packet.size()), true, directHl);
+    }
+    m_vif1PendingPath2ImageQwc = trailing.missingQw;
+    m_vif1PendingPath2ImageTag = trailing.tagLo;
+    m_vif1PendingPath2DirectHl = directHl;
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
@@ -304,29 +378,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        // Finish a DIRECT/DIRECTHL payload that started in an earlier call.
+        if (m_vif1DirectRemainingBytes != 0u)
         {
-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            if (availableQw == 0u)
+            const uint32_t take = std::min<uint32_t>(m_vif1DirectRemainingBytes, sizeBytes - pos);
+            m_vif1DirectBuffer.insert(m_vif1DirectBuffer.end(), data + pos, data + pos + take);
+            m_vif1DirectRemainingBytes -= take;
+            pos += take;
+            if (m_vif1DirectRemainingBytes == 0u)
             {
-                break;
-            }
-
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-
-            pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
+                submitVif1DirectPayload(m_vif1DirectBuffer.data(), static_cast<uint32_t>(m_vif1DirectBuffer.size()), m_vif1DirectHl);
+                m_vif1DirectBuffer.clear();
             }
             continue;
         }
@@ -487,34 +549,23 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
         {
-            uint32_t qwCount = imm;
-            if (qwCount == 0)
-                qwCount = 65536;
-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            const bool truncated = qwCount > availableQw;
-            if (qwCount > availableQw)
-                qwCount = availableQw;
-
-            if (qwCount > 0)
+            const uint32_t payloadBytes = (imm == 0u ? 65536u : static_cast<uint32_t>(imm)) * 16u;
+            const bool directHl = (opcode == VIF_DIRECTHL);
+            const uint32_t availableBytes = sizeBytes - pos;
+            if (payloadBytes <= availableBytes)
             {
-                const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
-                if (pendingImageQw != 0u)
-                {
-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
-                    m_vif1PendingPath2DirectHl = directHl;
-                }
+                submitVif1DirectPayload(data + pos, payloadBytes, directHl);
+                pos += payloadBytes;
+                continue;
             }
 
-            pos += qwCount * 16;
-            if (truncated)
-            {
-                pos = sizeBytes;
-                break;
-            }
-            continue;
+            // The payload continues in the next transfer (FIFO writes, chunked DMA): keep what
+            // is here and send the whole payload once it is complete.
+            m_vif1DirectBuffer.assign(data + pos, data + sizeBytes);
+            m_vif1DirectRemainingBytes = payloadBytes - availableBytes;
+            m_vif1DirectHl = directHl;
+            pos = sizeBytes;
+            break;
         }
         else if ((opcode & 0x60) == 0x60)
         {

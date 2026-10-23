@@ -343,6 +343,8 @@ public:
     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+    // Forwards one complete DIRECT/DIRECTHL payload to GIF PATH2.
+    void submitVif1DirectPayload(const uint8_t *data, uint32_t sizeBytes, bool directHl);
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
@@ -407,8 +409,16 @@ public:
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
+    // PATH2 IMAGE data still owed by a GIFtag that ended an earlier DIRECT payload; the data
+    // arrives in the payload of the following DIRECT/DIRECTHL command(s).
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
+    uint64_t m_vif1PendingPath2ImageTag = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    // DIRECT/DIRECTHL payload that did not fit in the data handed to processVIF1Data
+    // (VIF1 FIFO writes, chunked transfers); completed by the next call.
+    std::vector<uint8_t> m_vif1DirectBuffer;
+    uint32_t m_vif1DirectRemainingBytes = 0u;
+    bool m_vif1DirectHl = false;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer
