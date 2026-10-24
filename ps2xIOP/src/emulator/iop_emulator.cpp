@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <span>
@@ -113,6 +115,57 @@ namespace ps2x::iop::detail
             reset();
         }
 
+        // PS2X_IOP_PROFILE=1: every 5 s, log IOP instructions per second, the hottest guest PCs and
+        // threads, and the scheduler's loop counts (to find what keeps the IOP busy).
+        struct Profile
+        {
+            bool enabled = std::getenv("PS2X_IOP_PROFILE") != nullptr;
+            std::vector<uint32_t> pcCounts;
+            std::map<int, uint64_t> threadInstructions;
+            std::map<int, std::pair<uint32_t, uint32_t>> threadInfo; // entry, priority
+            uint64_t loops = 0, slices = 0, idleSkips = 0, idleCycles = 0, imports = 0;
+            uint64_t lastInstructions = 0, lastCycles = 0;
+            std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        } profile;
+
+        void reportProfile()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - profile.last).count();
+            if (seconds < 5.0)
+                return;
+            std::vector<std::pair<uint32_t, uint32_t>> hot; // count, pc
+            for (uint32_t i = 0; i < profile.pcCounts.size(); ++i)
+                if (profile.pcCounts[i])
+                    hot.emplace_back(profile.pcCounts[i], i << 2);
+            std::partial_sort(hot.begin(), hot.begin() + std::min<size_t>(hot.size(), 16u), hot.end(),
+                              [](const auto &a, const auto &b) { return a.first > b.first; });
+            const uint64_t instructions = totalInstructions - profile.lastInstructions;
+            std::ostringstream out;
+            out << "[IOP profile] " << static_cast<uint64_t>(instructions / seconds) << " instructions/s, "
+                << static_cast<uint64_t>((totalCycles - profile.lastCycles) / seconds) << " cycles/s; per s: loops "
+                << static_cast<uint64_t>(profile.loops / seconds) << ", slices " << static_cast<uint64_t>(profile.slices / seconds)
+                << ", idle skips " << static_cast<uint64_t>(profile.idleSkips / seconds) << " (" << static_cast<uint64_t>(profile.idleCycles / seconds)
+                << " cycles), imports " << static_cast<uint64_t>(profile.imports / seconds) << "\n  threads:";
+            for (const auto &[id, count] : profile.threadInstructions)
+                out << " #" << id << " entry=0x" << std::hex << profile.threadInfo[id].first << " pri=0x" << profile.threadInfo[id].second
+                    << std::dec << " " << (100.0 * count / std::max<uint64_t>(1u, instructions)) << "%;";
+            out << "\n  timers (calls over " << seconds << " s):" << timrman.debugSummary();
+            out << "\n  pending DMA interrupts:";
+            for (const auto &[irq, cycle] : pendingDmaInterrupts)
+                out << " irq " << irq << " in " << (cycle > totalCycles ? cycle - totalCycles : 0u) << " cycles;";
+            out << "\n  hot PCs:";
+            for (size_t i = 0; i < std::min<size_t>(hot.size(), 16u); ++i)
+                out << " 0x" << std::hex << hot[i].second << std::dec << "=" << (100.0 * hot[i].first / std::max<uint64_t>(1u, instructions)) << "%";
+            log(LogLevel::Info, out.str());
+            std::fill(profile.pcCounts.begin(), profile.pcCounts.end(), 0u);
+            profile.threadInstructions.clear();
+            profile.loops = profile.slices = profile.idleSkips = profile.idleCycles = profile.imports = 0;
+            profile.lastInstructions = totalInstructions;
+            profile.lastCycles = totalCycles;
+            profile.last = now;
+        }
+
         void reset()
         {
             memory.reset();
@@ -131,6 +184,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            idleUntil = 0;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -378,8 +432,17 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
+            if (profile.enabled)
+            {
+                if (profile.pcCounts.empty())
+                    profile.pcCounts.assign(kRamSize / 4u, 0u);
+                ++profile.pcCounts[physicalAddress(cpu.pc) >> 2];
+            }
+
             if (const auto import = imports.decode(cpu.pc))
             {
+                if (profile.enabled)
+                    ++profile.imports;
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
                 ++totalCycles;
@@ -560,27 +623,45 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    if (profile.enabled)
+                        ++profile.loops;
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
+                        uint64_t nextWake = kernel.nextWakeCycle(UINT64_MAX);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
-                        totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                        idleUntil = nextWake;
+                        const uint64_t skipTo = std::max(totalCycles + 1u, std::min(target, nextWake));
+                        if (profile.enabled)
+                        {
+                            ++profile.idleSkips;
+                            profile.idleCycles += skipTo - totalCycles;
+                        }
+                        totalCycles = skipTo;
                         continue;
                     }
+                    idleUntil = 0;
                     const uint64_t before = totalCycles;
-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                    const uint32_t ran = runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                    if (profile.enabled)
+                    {
+                        ++profile.slices;
+                        profile.threadInstructions[next->id] += ran;
+                        profile.threadInfo[next->id] = {next->entry, next->priority};
+                    }
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
                     if (totalCycles == before)
                         ++totalCycles;
                 }
+                if (profile.enabled)
+                    reportProfile();
             }
             catch (...)
             {
@@ -702,6 +783,9 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        // No thread is ready and nothing is due before this cycle, so runEeCycles can just advance
+        // time. Set by runCycles' idle path; cleared by every call that can change IOP state.
+        uint64_t idleUntil = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -726,16 +810,19 @@ namespace ps2x::iop::detail
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->idleUntil = 0;
         return m_impl->loadModule(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->idleUntil = 0;
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
+        m_impl->idleUntil = 0;
         return m_impl->stopModule(moduleId, result);
     }
 
@@ -744,12 +831,21 @@ namespace ps2x::iop::detail
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        if (!iopCycles)
+            return;
+        // Idle IOP: the scheduler loop would only advance time, so skip it. The EE calls this at
+        // every checkpoint with a few dozen IOP cycles, far more often than anything happens.
+        if (m_impl->totalCycles + iopCycles < m_impl->idleUntil)
+        {
+            m_impl->totalCycles += iopCycles;
+            return;
+        }
+        m_impl->runCycles(iopCycles);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        m_impl->idleUntil = 0;
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 
@@ -760,16 +856,19 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        m_impl->idleUntil = 0;
         m_impl->rpc.onSifTransfer(transfer);
     }
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
     {
+        m_impl->idleUntil = 0;
         return m_impl->memory.allocate(size, alignment);
     }
 
     bool IopEmulator::freeMemory(uint32_t address)
     {
+        m_impl->idleUntil = 0;
         return m_impl->memory.freeAllocation(address);
     }
 
@@ -781,12 +880,14 @@ namespace ps2x::iop::detail
 
     bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
     {
+        m_impl->idleUntil = 0;
         return isMemoryRange(address, size) &&
                m_impl->memory.writeRam(address, source, size);
     }
 
     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
     {
+        m_impl->idleUntil = 0;
         return isMemoryRange(address, size) &&
                m_impl->memory.zeroRam(address, size);
     }

@@ -12,6 +12,9 @@ namespace ps2x::iop::detail
         constexpr uint32_t kDmaStart = 1u << 24u;
         constexpr int kDmaSpu0Irq = 0x24;
         constexpr int kDmaSpu1Irq = 0x28;
+        constexpr uint32_t kSpu2Core0Admas = 0x1F9001B0u;
+        constexpr uint32_t kSpu2Core1Admas = 0x1F9005B0u;
+        constexpr uint64_t kIopCyclesPerSpuSample = 36'864'000u / 48'000u; // 768
 
         uint32_t alignUp(uint32_t value, uint32_t alignment)
         {
@@ -269,9 +272,17 @@ namespace ps2x::iop::detail
         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
+        // AutoDMA (the core's ADMAS bit set, as libsd's streaming block transfers do): the SPU2
+        // pulls one 32-bit stereo sample per 48 kHz tick, so the transfer drains at playback rate.
+        // Completing it at bus speed would make a streaming driver refill as fast as the IOP runs.
+        const uint32_t admasAddress = secondCore ? kSpu2Core1Admas : kSpu2Core0Admas;
+        uint32_t admas = 0u;
+        if (const auto current = m_hardware.find(admasAddress); current != m_hardware.end())
+            admas = current->second & 0xFFFFu;
+        const bool autoDma = (admas & (secondCore ? 2u : 1u)) != 0u;
         m_dmaStart = DmaStart{
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
-            std::max<uint64_t>(transferWords * 2u, 64u),
+            autoDma ? transferWords * kIopCyclesPerSpuSample : std::max<uint64_t>(transferWords * 2u, 64u),
         };
     }
 

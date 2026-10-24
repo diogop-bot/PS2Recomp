@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace ps2x::iop::detail
 {
@@ -17,6 +18,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+        // Running timers (source, prescale, compare, handler calls since the last summary), for profiling.
+        [[nodiscard]] std::string debugSummary();
 
     private:
         struct Callback
@@ -46,6 +49,7 @@ namespace ps2x::iop::detail
             uint64_t overflowCycle = UINT64_MAX;
             bool configured = false;
             bool running = false;
+            uint64_t handlerCalls = 0u; // for debugSummary()
 
             Callback compareCallback;
             Callback overflowCallback;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <sstream>
 
 namespace ps2x::iop::detail
 {
@@ -436,6 +437,7 @@ namespace ps2x::iop::detail
                 continue;
 
             const Callback callback = compareDue ? timer.compareCallback : timer.overflowCallback;
+            ++timer.handlerCalls;
             timer.compareCycle = UINT64_MAX;
             timer.overflowCycle = UINT64_MAX;
             const uint32_t result = callback.function != 0u
@@ -461,6 +463,22 @@ namespace ps2x::iop::detail
             schedule(timer, currentCycle);
         }
 
+    }
+
+    std::string IopTimrman::debugSummary()
+    {
+        std::ostringstream out;
+        for (Timer &timer : m_timers)
+        {
+            if (!timer.running && timer.handlerCalls == 0u)
+                continue;
+            out << " [timer 0x" << std::hex << timer.address << std::dec << " source " << timer.source
+                << " prescale " << timer.prescale << " width " << static_cast<uint32_t>(timer.width)
+                << " compare " << timer.compare << " handler 0x" << std::hex << timer.compareCallback.function
+                << std::dec << " calls " << timer.handlerCalls << (timer.running ? "" : " stopped") << "]";
+            timer.handlerCalls = 0u;
+        }
+        return out.str();
     }
 
     uint64_t IopTimrman::nextEventCycle(uint64_t fallback) const noexcept
