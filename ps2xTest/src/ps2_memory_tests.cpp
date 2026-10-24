@@ -1004,11 +1004,61 @@ void register_ps2_memory_tests()
             {
                 vifPacket.push_back(static_cast<uint8_t>(0xD2u + i));
             }
+            // Byte 7 of the payload's GIFtag holds FLG/NREG: keep FLG = PACKED, since a trailing
+            // IMAGE tag would (correctly) be held until its data arrives with the next DIRECT.
+            vifPacket[4u + 7u] = 0xD1u;
             mem.processVIF1Data(vifPacket.data(), static_cast<uint32_t>(vifPacket.size()));
 
             t.Equals(firstBytes.size(), static_cast<size_t>(2u), "PATH3 and DIRECTHL packets should both drain");
+            if (firstBytes.size() < 2u)
+                return;
             t.Equals(firstBytes[0], static_cast<uint8_t>(0xAAu), "DIRECTHL should not preempt queued PATH3 IMAGE packet");
             t.Equals(firstBytes[1], static_cast<uint8_t>(0xD2u), "DIRECTHL packet should drain after PATH3 IMAGE packet");
+        });
+
+        tc.Run("VIF DIRECT IMAGE data continues from the next DIRECT payload", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<std::vector<uint8_t>> packets;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                packets.emplace_back(data, data + sizeBytes);
+            });
+            mem.setGifArbiter(&arbiter);
+
+            // DIRECT 2: an IMAGE tag for 2 QW followed by the first QW of pixels; DIRECT 1: the second QW.
+            std::vector<uint8_t> vifPacket;
+            appendU32(vifPacket, makeVifCmd(0x50u, 0u, 2u));
+            appendU64(vifPacket, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(vifPacket, 0ull);
+            vifPacket.insert(vifPacket.end(), 16u, static_cast<uint8_t>(0x11u));
+            appendU32(vifPacket, makeVifCmd(0x50u, 0u, 1u));
+            vifPacket.insert(vifPacket.end(), 16u, static_cast<uint8_t>(0x22u));
+            mem.processVIF1Data(vifPacket.data(), static_cast<uint32_t>(vifPacket.size()));
+
+            t.Equals(packets.size(), static_cast<size_t>(2u), "each DIRECT should send its part of the image");
+            if (packets.size() < 2u)
+                return;
+            const auto tagOf = [](const std::vector<uint8_t> &packet)
+            {
+                uint64_t tag = 0;
+                std::memcpy(&tag, packet.data(), sizeof(tag));
+                return tag;
+            };
+            for (size_t i = 0; i < 2u; ++i)
+            {
+                t.Equals(packets[i].size(), static_cast<size_t>(32u), "each part should be one tag plus one QW");
+                if (packets[i].size() < 32u)
+                    return;
+                t.Equals(static_cast<uint32_t>(tagOf(packets[i]) & 0x7FFFu), 1u, "each part's tag should announce its own QW");
+                t.Equals(static_cast<uint32_t>((tagOf(packets[i]) >> 58) & 3u), static_cast<uint32_t>(GIF_FMT_IMAGE), "each part should stay IMAGE");
+            }
+            t.Equals(static_cast<uint32_t>((tagOf(packets[0]) >> 15) & 1u), 0u, "the first part should not end the packet");
+            t.Equals(static_cast<uint32_t>((tagOf(packets[1]) >> 15) & 1u), 1u, "the last part should carry the original EOP");
+            t.Equals(packets[0][16], static_cast<uint8_t>(0x11u), "the first part should carry the first DIRECT's pixels");
+            t.Equals(packets[1][16], static_cast<uint8_t>(0x22u), "the second part should carry the second DIRECT's pixels, not VIF codes");
         });
 
         tc.Run("GIF DMA mode0 copies RDRAM packet and clears channel", [](TestCase &t)
@@ -1382,12 +1432,15 @@ void register_ps2_memory_tests()
             uint8_t *rdram = mem.getRDRAM();
             std::memset(rdram + kSrc, 0, kQwc * 16u);
 
-            // DIRECT 1 QW.
+            // DIRECT 1 QW. Byte 7 of the payload's GIFtag holds FLG/NREG: keep FLG = PACKED, since a
+            // trailing IMAGE tag would (correctly) be held until its data arrives with the next DIRECT.
+            const auto payloadByte = [](uint32_t i)
+            { return static_cast<uint8_t>(i == 7u ? 0x01u : ((0x11u + i) & 0xFFu)); };
             const uint32_t cmd = makeVifCmd(0x50u, 0u, 1u);
             std::memcpy(rdram + kSrc, &cmd, sizeof(cmd));
             for (uint32_t i = 0; i < 16u; ++i)
             {
-                rdram[kSrc + 4u + i] = static_cast<uint8_t>((0x11u + i) & 0xFFu);
+                rdram[kSrc + 4u + i] = payloadByte(i);
             }
 
             std::vector<std::vector<uint8_t>> captured;
@@ -1403,11 +1456,13 @@ void register_ps2_memory_tests()
             mem.processPendingTransfers();
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "VIF1 DIRECT should emit one GIF packet");
+            if (captured.empty())
+                return;
             t.Equals(captured[0].size(), static_cast<size_t>(16u), "VIF1 DIRECT packet should be 1 QW");
-            bool contentOk = true;
-            for (uint32_t i = 0; i < 16u; ++i)
+            bool contentOk = captured[0].size() >= 16u;
+            for (uint32_t i = 0; contentOk && i < 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>((0x11u + i) & 0xFFu))
+                if (captured[0][i] != payloadByte(i))
                 {
                     contentOk = false;
                     break;
@@ -2112,7 +2167,7 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "VIF1 DIRECT image should update GS VRAM through GIF path2");
         });
 
-        tc.Run("VIF1 DIRECT image tag can continue with raw image qwords", [](TestCase &t)
+        tc.Run("VIF1 DIRECT image tag continues with the next DIRECT's qwords", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -2141,6 +2196,9 @@ void register_ps2_memory_tests()
             appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            // On hardware the VIF decodes whatever follows a DIRECT as VIF codes, so the pixels
+            // arrive in a second DIRECT (games often put it behind a new DMAtag).
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
             for (uint32_t i = 0; i < 16u; ++i)
             {
                 packet.push_back(static_cast<uint8_t>(0xA0u + i));
@@ -2162,7 +2220,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
+            t.IsTrue(imageOk, "the next DIRECT's qwords should continue the PATH2 image upload");
         });
 
         tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
@@ -2194,6 +2252,7 @@ void register_ps2_memory_tests()
             appendU64(packet, GS_REG_TEXA);
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // the pixels, in their own DIRECT
             for (uint32_t i = 0; i < 16u; ++i)
                 packet.push_back(static_cast<uint8_t>(0xC0u + i));
 
@@ -2213,7 +2272,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
+            t.IsTrue(imageOk, "an image continuation after packed setup should not be decoded as GIF registers");
         });
 
         tc.Run("unaligned accesses throw", [](TestCase &t)
