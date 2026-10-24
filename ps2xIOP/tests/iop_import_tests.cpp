@@ -3,13 +3,17 @@
 #include "emulator/core/iop_memory.h"
 #include "emulator/imports/iop_cdvd.h"
 #include "emulator/imports/iop_imports.h"
+#include "emulator/imports/iop_ioman.h"
 #include "emulator/imports/iop_loadcore.h"
 #include "emulator/imports/iop_timrman.h"
 #include "emulator/services/iop_rpc.h"
 #include "ps2x/iop/iop_host.h"
+#include "ps2x/iop/ps2_path.h"
 
 #include <cstdint>
 #include <chrono>
+#include <cstdio>
+#include <map>
 #include <cstring>
 #include <iostream>
 #include <fstream>
@@ -64,6 +68,75 @@ namespace
 
     private:
         std::filesystem::path root;
+    };
+
+    // Serves cdrom0: paths from a host directory with real file handles.
+    class FileHost final : public NullHost
+    {
+    public:
+        explicit FileHost(std::filesystem::path rootPath)
+            : root(std::move(rootPath))
+        {
+        }
+
+        ~FileHost() override
+        {
+            for (auto &[handle, stream] : files)
+                std::fclose(stream);
+        }
+
+        std::string translateGuestPath(std::string_view path) const override
+        {
+            const ParsedPs2Path parsed = parsePs2Path(path);
+            return parsed.device == Ps2PathDevice::Cdrom ? (root / parsed.path).string() : std::string{};
+        }
+
+        uint64_t openHostFile(std::string_view path) override
+        {
+            std::FILE *stream = std::fopen(std::string(path).c_str(), "rb");
+            if (!stream)
+                return 0u;
+            files.emplace(nextHandle, stream);
+            return nextHandle++;
+        }
+
+        bool hostFileSize(uint64_t handle, uint64_t &size) const override
+        {
+            const auto file = files.find(handle);
+            if (file == files.end())
+                return false;
+            const long position = std::ftell(file->second);
+            std::fseek(file->second, 0, SEEK_END);
+            size = static_cast<uint64_t>(std::ftell(file->second));
+            std::fseek(file->second, position, SEEK_SET);
+            return true;
+        }
+
+        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size, size_t &bytesRead) override
+        {
+            const auto file = files.find(handle);
+            if (file == files.end() || std::fseek(file->second, static_cast<long>(offset), SEEK_SET) != 0)
+                return false;
+            bytesRead = std::fread(destination, 1, size, file->second);
+            return true;
+        }
+
+        void closeHostFile(uint64_t handle) override
+        {
+            const auto file = files.find(handle);
+            if (file == files.end())
+                return;
+            std::fclose(file->second);
+            files.erase(file);
+            ++closed;
+        }
+
+        size_t closed = 0u;
+
+    private:
+        std::filesystem::path root;
+        std::map<uint64_t, std::FILE *> files;
+        uint64_t nextHandle = 1u;
     };
 
     class RecordingExecutor final : public IopGuestExecutor
@@ -274,6 +347,70 @@ namespace
         return passed;
     }
 
+    bool testIomanReadOnlyFile()
+    {
+        const auto suffix = std::to_string(
+            static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+        const std::filesystem::path root =
+            std::filesystem::temp_directory_path() / ("ps2x-iop-ioman-" + suffix);
+        std::error_code error;
+        std::filesystem::create_directories(root / "SOUND", error);
+        if (!expect(!error, "could not create the temporary CD root"))
+            return false;
+        {
+            std::ofstream music(root / "SOUND" / "MUSIC.WAV", std::ios::binary);
+            music.write("0123456789ABCDEF", 16);
+        }
+
+        bool passed = true;
+        {
+            FileHost host(root);
+            IopMemory memory;
+            IopIoman ioman(host, memory);
+            ioman.reset();
+            RecordingExecutor executor;
+
+            constexpr uint32_t pathAddress = 0x2480u;
+            constexpr uint32_t missingAddress = 0x2500u;
+            constexpr uint32_t bufferAddress = 0x2600u;
+            const char path[] = "cdrom0:\\SOUND\\MUSIC.WAV;1";
+            const char missing[] = "cdrom0:\\SOUND\\NONE.WAV;1";
+            (void)memory.writeRam(pathAddress, path, sizeof(path));
+            (void)memory.writeRam(missingAddress, missing, sizeof(missing));
+            (void)memory.zeroRam(bufferAddress, 16u);
+
+            const auto call = [&](uint16_t ordinal, uint32_t a0, uint32_t a1 = 0u, uint32_t a2 = 0u)
+            {
+                IopCpuState cpu{};
+                cpu.gpr[4] = a0;
+                cpu.gpr[5] = a1;
+                cpu.gpr[6] = a2;
+                if (!ioman.dispatchImport(ordinal, cpu, executor))
+                    return INT32_MIN;
+                return static_cast<int32_t>(cpu.gpr[2]);
+            };
+
+            const uint32_t fd = static_cast<uint32_t>(call(4u, pathAddress, 1u)); // O_RDONLY
+            passed = expect(static_cast<int32_t>(fd) >= 3, "ioman open did not return a file descriptor") &&
+                     expect(call(8u, fd, 4u, 0u) == 4, "lseek SEEK_SET returned the wrong position") &&
+                     expect(call(6u, fd, bufferAddress, 8u) == 8, "read did not return 8 bytes") &&
+                     expect(memory.readString(bufferAddress, 8u) == "456789AB", "read returned the wrong bytes") &&
+                     expect(call(8u, fd, 0u, 1u) == 12, "lseek SEEK_CUR did not report the cursor") &&
+                     expect(call(8u, fd, static_cast<uint32_t>(-2), 2u) == 14, "lseek SEEK_END returned the wrong position") &&
+                     expect(call(6u, fd, bufferAddress, 8u) == 2, "read past the end was not shortened") &&
+                     expect(call(6u, fd, bufferAddress, 8u) == 0, "read at the end did not return 0") &&
+                     expect(call(8u, fd, static_cast<uint32_t>(-1), 0u) == -22, "lseek before the start was accepted") &&
+                     expect(call(5u, fd) == 0, "close failed") &&
+                     expect(host.closed == 1u, "close did not release the host file") &&
+                     expect(call(6u, fd, bufferAddress, 8u) == -9, "read after close did not fail with EBADF") &&
+                     expect(call(4u, missingAddress, 1u) == -2, "opening a missing file did not fail with ENOENT") &&
+                     expect(call(4u, pathAddress, 2u) == -13, "opening for writing did not fail with EACCES");
+        }
+
+        std::filesystem::remove_all(root, error);
+        return passed;
+    }
+
     bool testTimrmanPeriodicCallback()
     {
         IopTimrman timrman;
@@ -331,7 +468,7 @@ namespace
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback())
+        !testIomanReadOnlyFile() || !testTimrmanPeriodicCallback())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;
