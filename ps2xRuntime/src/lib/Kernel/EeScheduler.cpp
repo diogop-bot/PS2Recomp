@@ -2,6 +2,7 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ps2_host_hooks.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1888,6 +1889,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         }
         m_vsyncFlagAddress = 0u;
         m_vsyncTickAddress = 0u;
+        ps2_host_hooks::notifyVBlank(m_vsyncTick);
         completeVSync(m_vsyncTick);
         if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
         {

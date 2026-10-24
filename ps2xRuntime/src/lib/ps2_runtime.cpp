@@ -13,6 +13,7 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "runtime/ps2_host_hooks.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -2339,6 +2340,57 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+namespace ps2_host_hooks
+{
+    namespace
+    {
+        std::atomic<VBlankFn> s_vblankFn{nullptr};
+        std::atomic<void *> s_vblankUser{nullptr};
+        PresentFn s_presentFn = nullptr;
+        void *s_presentUser = nullptr;
+        ShutdownFn s_shutdownFn = nullptr;
+        void *s_shutdownUser = nullptr;
+    }
+
+    void setVBlankHook(VBlankFn fn, void *user)
+    {
+        s_vblankUser.store(user, std::memory_order_relaxed);
+        s_vblankFn.store(fn, std::memory_order_release);
+    }
+
+    void setPresentHook(PresentFn fn, void *user)
+    {
+        s_presentFn = fn;
+        s_presentUser = user;
+    }
+
+    void setShutdownHook(ShutdownFn fn, void *user)
+    {
+        s_shutdownFn = fn;
+        s_shutdownUser = user;
+    }
+
+    void notifyVBlank(uint64_t tick)
+    {
+        if (const VBlankFn fn = s_vblankFn.load(std::memory_order_acquire))
+            fn(s_vblankUser.load(std::memory_order_relaxed), tick);
+    }
+
+    bool runPresentHook()
+    {
+        if (!s_presentFn)
+            return false;
+        s_presentFn(s_presentUser);
+        return true;
+    }
+
+    void runShutdownHook()
+    {
+        if (s_shutdownFn)
+            s_shutdownFn(s_shutdownUser);
+    }
+}
+
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
@@ -2423,31 +2475,38 @@ void PS2Runtime::run()
 
             }
         });
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
-
-        BeginDrawing();
-        ClearBackground(BLACK);
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
-            dstWidth,
-            dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        if (m_debugUiInitialized && m_debugUiDrawCallback)
+        if (ps2_host_hooks::runPresentHook())
         {
-            m_debugUiDrawCallback(*this, m_debugUiUserData);
+            // An external presenter owns the window's contents.
         }
-        EndDrawing();
+        else
+        {
+            uint32_t presentWidth = FB_WIDTH;
+            uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+            UploadFrame(frameTex, this, presentWidth, presentHeight);
+
+            BeginDrawing();
+            ClearBackground(BLACK);
+            const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+            const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+            const float screenWidth = static_cast<float>(GetScreenWidth());
+            const float screenHeight = static_cast<float>(GetScreenHeight());
+            const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+            const float dstWidth = srcWidth * scale;
+            const float dstHeight = srcHeight * scale;
+            const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+            const Rectangle dstRect{
+                (screenWidth - dstWidth) * 0.5f,
+                (screenHeight - dstHeight) * 0.5f,
+                dstWidth,
+                dstHeight};
+            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            if (m_debugUiInitialized && m_debugUiDrawCallback)
+            {
+                m_debugUiDrawCallback(*this, m_debugUiUserData);
+            }
+            EndDrawing();
+        }
 
         if (WindowShouldClose())
         {
@@ -2462,6 +2521,7 @@ void PS2Runtime::run()
     {
         gameThread.join();
     }
+    ps2_host_hooks::runShutdownHook();
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {
