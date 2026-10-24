@@ -1,7 +1,9 @@
 #ifndef PS2_RUNTIME_MACROS_H
 #define PS2_RUNTIME_MACROS_H
+#include <atomic>
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <bit>
 #if defined(_MSC_VER)
@@ -576,8 +578,24 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         ? runtime->Load64(rdram, ctx, _addr)                  \
         : FAST_READ64(_addr); }())
 
+// LQ/SQ/LQC2/SQC2 ignore the low 4 address bits on the EE: an unaligned base reads or writes
+// the enclosing quadword. The first few occurrences are logged to show whether a game relies on it.
+inline void ps2NoteUnaligned128(uint32_t addr, uint32_t pc)
+{
+    static std::atomic<uint32_t> s_count{0};
+    if (s_count.fetch_add(1, std::memory_order_relaxed) < 32u)
+        std::fprintf(stderr, "[ps2] unaligned 128-bit access addr=0x%08x pc=0x%08x (aligned down)\n", addr, pc);
+}
+
+inline uint32_t ps2Align128(uint32_t addr, const R5900Context *ctx)
+{
+    if ((addr & 0xFu) != 0u)
+        ps2NoteUnaligned128(addr, ctx->pc);
+    return addr & ~0xFu;
+}
+
 #define READ128(addr) ([&]() -> __m128i {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
+    uint32_t _addr = ps2Align128((uint32_t)(addr), ctx);      \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load128(rdram, ctx, _addr)                 \
         : FAST_READ128(_addr); }())
@@ -637,7 +655,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 #define WRITE128(addr, val)                                                          \
     do                                                                               \
     {                                                                                \
-        uint32_t _addr = (addr);                                                     \
+        uint32_t _addr = ps2Align128((addr), ctx);                                   \
         __m128i _value = (val);                                                      \
         if (PS2Runtime::isSpecialAddress(_addr))                                     \
             runtime->Store128(rdram, ctx, _addr, _value);                            \
@@ -853,7 +871,17 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// CVT.W.S on the EE always rounds toward zero (there is no TRUNC.W.S, so compilers use it for
+// (int)f) and saturates out-of-range values, as PCSX2's FPU.cpp CVT_W does.
+inline int32_t ps2_fcvt_w_s(float a)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &a, sizeof(bits));
+    if ((bits & 0x7F800000u) <= 0x4E800000u)
+        return static_cast<int32_t>(a);
+    return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
+}
+#define FPU_CVT_W_S(a) ps2_fcvt_w_s((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
