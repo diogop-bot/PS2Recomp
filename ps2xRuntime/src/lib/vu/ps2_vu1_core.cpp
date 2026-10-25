@@ -1629,8 +1629,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
-    const int previousRoundingMode = std::fegetround();
-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    // VU arithmetic rounds toward zero. Save and restore MXCSR itself: on MSVC fegetround() reports
+    // the x87 mode, so restoring through fesetround() put the EE thread's SSE rounding back to nearest.
+    const unsigned int savedCsr = _mm_getcsr();
+    _mm_setcsr((savedCsr & ~0x6000u) | 0x6000u);
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
     while (m_cycle < budgetEnd && !m_stopRequested)
@@ -1833,6 +1835,5 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
-    if (useVuRounding && previousRoundingMode != -1)
-        std::fesetround(previousRoundingMode);
+    _mm_setcsr(savedCsr);
 }

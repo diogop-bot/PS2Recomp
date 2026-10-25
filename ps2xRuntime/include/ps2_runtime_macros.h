@@ -295,22 +295,48 @@ inline float ps2_fmul(float a, float b)
     return ps2_fnormal(r) ? r : ps2_fmul_slow(a, b);
 }
 
+// The EE FPU's divide/square-root unit rounds to nearest, while ADD/SUB/MUL chop (PCSX2's FPU recompiler
+// switches MXCSR to nearest around DIV.S, SQRT.S and RSQRT.S). Guest code runs with round-toward-zero, so
+// these compute in double and round to float explicitly, ties to even. For one division or square root of
+// floats the double result is precise enough (53 >= 2 * 24 + 2 bits) for this to be the correctly rounded
+// float. A result outside the normal float range takes the slow path.
+inline float ps2_fnearest(double d)
+{
+    uint64_t b = std::bit_cast<uint64_t>(d);
+    b += 0x0FFFFFFFull + ((b >> 29) & 1u); // half an ulp at float precision, ties to even
+    b &= ~((uint64_t{1} << 29) - 1u);
+    return static_cast<float>(std::bit_cast<double>(b)); // now exact, whatever the rounding mode
+}
+
+inline bool ps2_fnearest_in_range(double d)
+{
+    const double m = std::fabs(d);
+    return m >= 0x1p-126 && m < 0x1p128;
+}
+
 inline float ps2_fdiv(float a, float b)
 {
-    const float r = a / b;
-    return ps2_fall_normal(a, b, r) ? r : ps2_fdiv_slow(a, b);
+    const double q = static_cast<double>(a) / static_cast<double>(b);
+    const float r = ps2_fnearest(q);
+    return (ps2_fall_normal(a, b, r) && ps2_fnearest_in_range(q)) ? r : ps2_fdiv_slow(a, b);
 }
 
 inline float ps2_fsqrt(float a)
 {
-    const float r = std::sqrt(a);
-    return ps2_fall_normal(a, a, r) ? r : ps2_fsqrt_slow(a);
+    const double s = std::sqrt(static_cast<double>(a));
+    const float r = ps2_fnearest(s);
+    return (ps2_fall_normal(a, a, r) && ps2_fnearest_in_range(s)) ? r : ps2_fsqrt_slow(a);
 }
 
 inline float ps2_frsqrt(float a, float b)
 {
-    const float r = a / std::sqrt(b);
-    return ps2_fall_normal(a, b, r) ? r : ps2_frsqrt_slow(a, b);
+    // The root is rounded to a float before the division, as on the hardware.
+    const double s = std::sqrt(static_cast<double>(b));
+    const float root = ps2_fnearest(s);
+    const double q = static_cast<double>(a) / static_cast<double>(root);
+    const float r = ps2_fnearest(q);
+    return (ps2_fall_normal(a, b, r) && ps2_fnearest_in_range(s) && ps2_fnearest_in_range(q)) ? r
+                                                                                              : ps2_frsqrt_slow(a, b);
 }
 
 enum class Ps2VecOp
@@ -784,8 +810,10 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
 #define PS2_PPACB(a, b) ps2_ppacb((__m128i)(a), (__m128i)(b))
 
 // Packed Interleave (PINT)
-#define PS2_PINTH(a, b) _mm_unpacklo_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
-#define PS2_PINTEH(a, b) _mm_unpackhi_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
+// PINTH rd, rs, rt: rt's low four halfwords interleaved with rs's high four (rt.h0, rs.h4, rt.h1, rs.h5, ...).
+// PINTEH: the even halfwords of rt and rs interleaved (rt.h0, rs.h0, rt.h2, rs.h2, ...). a = rs, b = rt.
+#define PS2_PINTH(a, b) _mm_unpacklo_epi16((__m128i)(b), _mm_unpackhi_epi64((__m128i)(a), (__m128i)(a)))
+#define PS2_PINTEH(a, b) _mm_or_si128(_mm_and_si128((__m128i)(b), _mm_set1_epi32(0xFFFF)), _mm_slli_epi32((__m128i)(a), 16))
 
 // Packed Multiply-Add (PMADD)
 #define PS2_PMADDW(a, b) _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(1, 0, 3, 2)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(1, 0, 3, 2))), _mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0))))
@@ -883,22 +911,66 @@ inline int32_t ps2_fcvt_w_s(float a)
 }
 #define FPU_CVT_W_S(a) ps2_fcvt_w_s((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+// FPU compares (C.cond.S). The PS2 format has no unordered case: an exponent-0 value is zero and an
+// exponent-255 value is an ordinary number (the largest ones), so the hardware orders values by sign and
+// magnitude. A host compare would treat such a value as NaN and answer false: 0x7FFFFFFF, which x/0
+// gives, would then be neither less than nor greater than anything. The unordered conditions never hold.
+inline std::atomic<uint64_t> g_ps2FpuSpecialCompares{0}; // compares that needed the PS2 rule (diagnostics)
+
+inline int64_t ps2_fcmp_key(float x)
+{
+    const uint32_t b = std::bit_cast<uint32_t>(x);
+    if ((b & PS2_FLOAT_EXP_MASK) == 0u)
+        return 0;
+    const int64_t magnitude = static_cast<int64_t>(b & 0x7FFFFFFFu);
+    return (b & PS2_FLOAT_SIGN_MASK) ? -magnitude : magnitude;
+}
+
+PS2_FLOAT_NOINLINE inline int ps2_fcmp_slow(float a, float b)
+{
+    g_ps2FpuSpecialCompares.fetch_add(1, std::memory_order_relaxed);
+    const int64_t ka = ps2_fcmp_key(a);
+    const int64_t kb = ps2_fcmp_key(b);
+    return ka < kb ? -1 : (ka > kb ? 1 : 0);
+}
+
+inline bool ps2_fc_eq(float a, float b)
+{
+    if (!(ps2_fspecial(a) | ps2_fspecial(b)))
+        return a == b;
+    return ps2_fcmp_slow(a, b) == 0;
+}
+
+inline bool ps2_fc_lt(float a, float b)
+{
+    if (!(ps2_fspecial(a) | ps2_fspecial(b)))
+        return a < b;
+    return ps2_fcmp_slow(a, b) < 0;
+}
+
+inline bool ps2_fc_le(float a, float b)
+{
+    if (!(ps2_fspecial(a) | ps2_fspecial(b)))
+        return a <= b;
+    return ps2_fcmp_slow(a, b) <= 0;
+}
+
 #define FPU_C_F_S(a, b) (0)
-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_UN_S(a, b) (0)
+#define FPU_C_EQ_S(a, b) ps2_fc_eq((float)(a), (float)(b))
+#define FPU_C_UEQ_S(a, b) ps2_fc_eq((float)(a), (float)(b))
+#define FPU_C_OLT_S(a, b) ps2_fc_lt((float)(a), (float)(b))
+#define FPU_C_ULT_S(a, b) ps2_fc_lt((float)(a), (float)(b))
+#define FPU_C_OLE_S(a, b) ps2_fc_le((float)(a), (float)(b))
+#define FPU_C_ULE_S(a, b) ps2_fc_le((float)(a), (float)(b))
 #define FPU_C_SF_S(a, b) (0)
-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_NGLE_S(a, b) (0)
+#define FPU_C_SEQ_S(a, b) ps2_fc_eq((float)(a), (float)(b))
+#define FPU_C_NGL_S(a, b) ps2_fc_eq((float)(a), (float)(b))
+#define FPU_C_LT_S(a, b) ps2_fc_lt((float)(a), (float)(b))
+#define FPU_C_NGE_S(a, b) ps2_fc_lt((float)(a), (float)(b))
+#define FPU_C_LE_S(a, b) ps2_fc_le((float)(a), (float)(b))
+#define FPU_C_NGT_S(a, b) ps2_fc_le((float)(a), (float)(b))
 
 // QFSRV: Quadword Funnel Shift Right Variable
 // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
@@ -983,9 +1055,11 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 }
 #define PS2_QFSRV(rs, rt, sa) ps2_qfsrv((__m128i)(rs), (__m128i)(rt), (uint32_t)(sa))
 #define PS2_PCPYLD(rs, rt) _mm_unpacklo_epi64(rt, rs)
-#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(2, 3, 0, 1)), _MM_SHUFFLE(2, 3, 0, 1))
-#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(2, 3, 0, 1))
-#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(0, 3, 2, 1))
+// MMI exchanges, as the EE manual and PCSX2 (MMI.cpp) define them, lowest element first:
+// PEXEH: halfwords (2, 1, 0, 3) in each doubleword; PEXEW: words (2, 1, 0, 3); PROT3W: words (1, 2, 0, 3).
+#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(3, 0, 1, 2)), _MM_SHUFFLE(3, 0, 1, 2))
+#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 1, 2))
+#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 2, 1))
 
 // Additional VU0 operations
 #define PS2_VSQRT(x) sqrtf(x)

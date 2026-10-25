@@ -2419,9 +2419,10 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
-        // The EE FPU and VU0 round toward zero ("chop", PCSX2's default); SSE defaults to
-        // round-to-nearest. All guest code runs on this thread, so set it once here.
-        _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
+        // The EE FPU and VU0 round toward zero ("chop") and have no denormals, so run guest code
+        // with round-to-zero, flush-to-zero and denormals-are-zero (PCSX2's EE default). All guest
+        // code runs on this thread; anything that changes MXCSR here must restore it.
+        _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
