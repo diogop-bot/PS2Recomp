@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -355,9 +356,27 @@ void EeScheduler::postEvent(EeEvent event)
     m_eventCv.notify_one();
 }
 
+namespace
+{
+    // PS2X_EE_CYCLE_PERCENT=N charges N% of the nominal cost at each guest checkpoint (default 100).
+    // Below 100 the guest gets more work done per emulated vblank, like PCSX2's EE cycle rate
+    // overclock; idle waits still advance time at the real rate.
+    uint32_t guestCyclePercent() noexcept
+    {
+        static const uint32_t percent = []
+        {
+            const char *env = std::getenv("PS2X_EE_CYCLE_PERCENT");
+            const long value = env && *env ? std::strtol(env, nullptr, 10) : 100;
+            return static_cast<uint32_t>(std::clamp<long>(value, 1, 1000));
+        }();
+        return percent;
+    }
+}
+
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
-    accountCycles(cycles);
+    const uint32_t percent = guestCyclePercent();
+    accountCycles(percent == 100u ? cycles : std::max<uint32_t>(1u, cycles * percent / 100u));
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
