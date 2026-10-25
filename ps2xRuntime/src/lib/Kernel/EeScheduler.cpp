@@ -33,7 +33,22 @@ namespace
     constexpr uint32_t WEF_OR = 0x01u;
     constexpr uint32_t WEF_CLEAR = 0x10u;
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
+    // PS2X_VBLANK_HZ=N runs the emulated vblank at N Hz (default 60). A game that paces its frames
+    // by vblanks (waiting for two per frame, say) then runs at a higher frame rate with even frame
+    // times; anything the game times by counting vblanks speeds up with it.
+    uint32_t vblankPeriodMicroseconds() noexcept
+    {
+        static const uint32_t micros = []
+        {
+            const char *env = std::getenv("PS2X_VBLANK_HZ");
+            if (!env || !*env)
+                return 16667u;
+            const long hz = std::clamp<long>(std::strtol(env, nullptr, 10), 30, 1000);
+            return static_cast<uint32_t>(1000000L / hz);
+        }();
+        return micros;
+    }
+    const auto kVBlankPeriod = std::chrono::microseconds(vblankPeriodMicroseconds());
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
@@ -52,7 +67,7 @@ namespace
         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
     }
 
-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+    const uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(vblankPeriodMicroseconds());
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
@@ -1867,11 +1882,22 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // Vblanks wait for the guest's cycle count as well as the clock, so they run late
+                // while the EE is busy (a long load leaves seconds of them), and late ones fire
+                // back to back once the guest waits: bursts of fast frames that a game pacing by
+                // vblanks turns into uneven frame times. Catch up a few periods, which keeps the
+                // vblank rate right after one slow frame, but drop a longer backlog.
+                auto hostBase = scheduled.hostDeadline;
+                const auto firedAt = std::chrono::steady_clock::now();
+                if (firedAt - hostBase > 4 * kVBlankPeriod)
+                {
+                    hostBase = firedAt;
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                              hostBase + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              hostBase + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
