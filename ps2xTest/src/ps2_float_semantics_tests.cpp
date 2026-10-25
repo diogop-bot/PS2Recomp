@@ -210,7 +210,7 @@ void register_ps2_float_semantics_tests()
             t.Equals(laneBits(flushed, 3), bitsOf(0.5f), "lane 3: 1 * 0.5 should be 0.5");
         });
 
-        tc.Run("DIV.S and RSQRT.S translate to the PS2 semantics helpers", [](TestCase &t)
+        tc.Run("DIV.S, SQRT.S and RSQRT.S translate to the PS2 semantics helpers", [](TestCase &t)
         {
             CodeGenerator gen({}, {});
 
@@ -223,6 +223,11 @@ void register_ps2_float_semantics_tests()
             const std::string rsqrt = gen.translateInstruction(makeCop1S(COP1_S_RSQRT, 2, 3, 4));
             t.IsTrue(rsqrt.find("ctx->f[2] = FPU_RSQRT_S(ctx->f[3], ctx->f[4])") != std::string::npos,
                      "RSQRT.S should compute fs / sqrt(ft) but got: " + rsqrt);
+
+            // The EE encodes SQRT.S fd, ft with the operand in the ft field; fs is 0 in real code.
+            const std::string sqrt = gen.translateInstruction(makeCop1S(COP1_S_SQRT, 1, 0, 1));
+            t.IsTrue(sqrt.find("ctx->f[1] = FPU_SQRT_S(ctx->f[1])") != std::string::npos,
+                     "SQRT.S should take sqrt(ft) but got: " + sqrt);
         });
     });
 }

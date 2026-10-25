@@ -291,6 +291,25 @@ void register_code_generator_tests()
                  "MULT should not write rd when rd is zero");
     });
 
+    tc.Run("MOVZ and MOVN move only the low 64 bits", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        Instruction mov{};
+        mov.opcode = OPCODE_SPECIAL;
+        mov.rs = 4;
+        mov.rt = 5;
+        mov.rd = 3;
+        for (uint32_t function : {SPECIAL_MOVZ, SPECIAL_MOVN})
+        {
+            mov.function = function;
+            const std::string generated = gen.translateInstruction(mov);
+            t.IsTrue(generated.find("SET_GPR_U64(ctx, 3, GPR_U64(ctx, 4))") != std::string::npos,
+                     "MOVZ/MOVN should copy rs's low 64 bits to rd but got: " + generated);
+            t.IsTrue(generated.find("SET_GPR_VEC") == std::string::npos,
+                     "MOVZ/MOVN must keep rd's upper 64 bits but got: " + generated);
+        }
+    });
+
     tc.Run("R5900 MMI MULT1 writes rd when rd is non-zero", [](TestCase &t) {
         CodeGenerator gen({}, {});
 
