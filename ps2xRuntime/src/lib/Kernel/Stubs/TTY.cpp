@@ -37,23 +37,40 @@ namespace ps2_stubs
         TODO_NAMED("sceResetttyinit", rdram, ctx, runtime);
     }
 
+    // Sony's debug TTY (libscf). Games print through it on development kits; on retail
+    // hardware it is a no-op, so accept everything and forward written text to the log.
     void sceTtyHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceTtyHandler", rdram, ctx, runtime);
+        setReturnS32(ctx, 0);
     }
 
     void sceTtyInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceTtyInit", rdram, ctx, runtime);
+        setReturnS32(ctx, 1);
     }
 
     void sceTtyRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceTtyRead", rdram, ctx, runtime);
+        setReturnS32(ctx, 0);
     }
 
+    // int sceTtyWrite(const char *buf, int len)
     void sceTtyWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceTtyWrite", rdram, ctx, runtime);
+        const uint32_t bufAddr = getRegU32(ctx, 4);
+        const int32_t len = static_cast<int32_t>(getRegU32(ctx, 5));
+        if (bufAddr != 0u && len > 0)
+        {
+            std::string text;
+            for (int32_t i = 0; i < len && i < 4096; ++i)
+            {
+                const uint8_t *byte = getMemPtr(rdram, bufAddr + static_cast<uint32_t>(i));
+                if (!byte)
+                    break;
+                text.push_back(static_cast<char>(*byte));
+            }
+            std::cerr << "[tty] " << sanitizeForLog(text) << std::flush;
+        }
+        setReturnS32(ctx, len > 0 ? len : 0);
     }
 }

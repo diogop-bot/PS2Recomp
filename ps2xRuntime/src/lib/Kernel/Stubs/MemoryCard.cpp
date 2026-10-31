@@ -694,11 +694,35 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    namespace
+    {
+        // sceMcGetDir continuation: flags != 0 resumes the previous search on that port.
+        std::array<std::vector<SceMcTblGetDir>, 2> g_mcDirListings;
+        std::array<size_t, 2> g_mcDirCursors{};
+
+        int32_t emitMcDirEntriesLocked(uint8_t *rdram, int32_t port, int32_t maxEntries, uint32_t tableAddr)
+        {
+            const std::vector<SceMcTblGetDir> &listing = g_mcDirListings[static_cast<size_t>(port)];
+            size_t &cursor = g_mcDirCursors[static_cast<size_t>(port)];
+            const size_t remaining = cursor < listing.size() ? listing.size() - cursor : 0u;
+            const size_t entryCount = std::min(remaining, maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
+            if (entryCount == 0u || tableAddr == 0u)
+                return static_cast<int32_t>(entryCount);
+            uint8_t *dst = getMemPtr(rdram, tableAddr);
+            if (!dst)
+                return kMcResultDeniedPermit;
+            std::memcpy(dst, listing.data() + cursor, entryCount * sizeof(SceMcTblGetDir));
+            cursor += entryCount;
+            return static_cast<int32_t>(entryCount);
+        }
+    }
+
     void sceMcGetDir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+        const int32_t flags = static_cast<int32_t>(getRegU32(ctx, 7));
         const int32_t maxEntries = static_cast<int32_t>(getRegU32(ctx, 8));
         const uint32_t tableAddr = getRegU32(ctx, 9);
 
@@ -713,8 +737,14 @@ namespace ps2_stubs
                 {
                     result = kMcResultNoFormat;
                 }
+                else if (flags != 0)
+                {
+                    result = emitMcDirEntriesLocked(rdram, port, maxEntries, tableAddr);
+                }
                 else
                 {
+                    g_mcDirListings[static_cast<size_t>(port)].clear();
+                    g_mcDirCursors[static_cast<size_t>(port)] = 0u;
                     ensureMcRootExists(port);
                     const std::string guestQuery =
                         normalizeGuestMcPathLocked(port, rawPath.empty() ? "." : rawPath);
@@ -821,29 +851,16 @@ namespace ps2_stubs
                             entries.push_back(tableEntry);
                         }
 
-                        const size_t entryCount =
-                            std::min(entries.size(), maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
-                        if (entryCount == 0u || tableAddr == 0u)
-                        {
-                            result = static_cast<int32_t>(entryCount);
-                        }
-                        else if (uint8_t *dst = getMemPtr(rdram, tableAddr))
-                        {
-                            std::memcpy(dst, entries.data(), entryCount * sizeof(SceMcTblGetDir));
-                            result = static_cast<int32_t>(entryCount);
-                        }
-                        else
-                        {
-                            result = kMcResultDeniedPermit;
-                        }
+                        g_mcDirListings[static_cast<size_t>(port)] = std::move(entries);
+                        result = emitMcDirEntriesLocked(rdram, port, maxEntries, tableAddr);
                     }
                 }
             }
 
             setMcCommandResultLocked(kMcCmdGetDir, result);
         }
-        RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
-                                        << "' maxent=" << maxEntries << " -> result=" << result);
+        RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath << "' flags=" << flags
+                                        << " maxent=" << maxEntries << " -> result=" << result);
         setReturnS32(ctx, 0);
     }
 

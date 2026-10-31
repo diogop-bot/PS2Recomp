@@ -583,6 +583,41 @@ void register_ps2_runtime_io_tests()
                      "sceMcGetDir file entries should carry the closed-file attribute");
         });
 
+        tc.Run("sceMcGetDir continues the previous search when flags is nonzero", [](TestCase &t)
+        {
+            TestContext test;
+
+            std::filesystem::create_directories(test.paths.mcRoot / "SAVEDATA");
+            for (const char *name : {"a.c", "b.c", "other.bin"})
+                std::ofstream(test.paths.mcRoot / "SAVEDATA" / name, std::ios::binary) << "x";
+
+            const uint32_t patternAddr = GUEST_STRING_AREA_START + 0x700;
+            writeGuestString(test.rdram.data(), patternAddr, "/SAVEDATA/*.c");
+
+            const auto *entry = reinterpret_cast<const SceMcTblGetDir *>(test.rdram.data() + GUEST_MC_TABLE_ADDR);
+            auto getDir = [&](uint32_t flags)
+            {
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 4, 0u);
+                setRegU32(test.ctx, 5, 0u);
+                setRegU32(test.ctx, 6, patternAddr);
+                setRegU32(test.ctx, 7, flags);
+                setRegU32(test.ctx, 8, 1u);
+                setRegU32(test.ctx, 9, GUEST_MC_TABLE_ADDR);
+                ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
+                int32_t cmd = 0;
+                return syncMc(test.rdram, &cmd);
+            };
+
+            t.Equals(getDir(0u), 1, "the first search should return one entry");
+            t.Equals(std::string(entry->entryName), std::string("a.c"), "the first search should start at a.c");
+            t.Equals(getDir(1u), 1, "a continued search should return the next entry");
+            t.Equals(std::string(entry->entryName), std::string("b.c"), "a continued search should move on to b.c");
+            t.Equals(getDir(1u), 0, "a continued search should report 0 once the matches run out");
+            t.Equals(getDir(0u), 1, "flags 0 should restart the search");
+            t.Equals(std::string(entry->entryName), std::string("a.c"), "a restarted search should begin at a.c again");
+        });
+
         tc.Run("sceMcGetInfo reports formatted and unformatted states", [](TestCase &t)
         {
             TestContext test;
