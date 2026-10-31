@@ -1892,6 +1892,7 @@ namespace
     {
         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
             return;
+        runtime->memory().syncGsWorker("gs stub");
         for (size_t i = 0; i < pairCount; ++i)
         {
             runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);

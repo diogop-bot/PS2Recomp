@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <iostream>
+#include <memory>
 #include <mutex>
 
 #include "gs/ps2_gif_arbiter.h"
@@ -343,9 +344,20 @@ public:
     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+    // Specialised UNPACK loops (tests turn them off to compare with the generic loop).
+    static inline bool s_vif1FastUnpack = true;
     // Forwards one complete DIRECT/DIRECTHL payload to GIF PATH2.
     void submitVif1DirectPayload(const uint8_t *data, uint32_t sizeBytes, bool directHl);
-    void processPendingTransfers();
+    void processPendingTransfers(bool fromDmaKick = false);
+
+    // GS worker (off by default). When on, GIF and VIF1 DMA kicks still copy their data and
+    // complete at once, and a worker thread unpacks the VIF1 data, runs VU1 and feeds the GS, in
+    // order. EE-side code that touches GIF/VIF1/VU1/GS state waits for it first (syncGsWorker).
+    void setGsWorker(bool enabled);
+    bool gsWorkerEnabled() const { return m_gsWorker != nullptr; }
+    void syncGsWorker(const char *reason) const;
+    // Runs fn on the worker after the work queued so far, or at once when the worker is off.
+    void postToGsWorker(std::function<void()> fn);
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
     int pollDmaRegisters();
@@ -431,6 +443,15 @@ public:
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
+    struct GsWorker;
+    std::unique_ptr<GsWorker> m_gsWorker;
+    bool onGsWorkerThread() const;
+    void runGsWorker();
+    void enqueueGsWork(std::vector<uint8_t> &&data, bool gif);
+    void gifTransfer(const uint8_t *data, uint32_t sizeBytes, bool async);
+    void gifTransfer(std::vector<uint8_t> &&data, bool async);
+    void vif1Transfer(const uint8_t *data, uint32_t sizeBytes, bool async);
+    void vif1Transfer(std::vector<uint8_t> &&data, bool async);
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
 

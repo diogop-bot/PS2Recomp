@@ -1348,6 +1348,20 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+namespace
+{
+    // Counts dispatches that returned false (the generated caller returns, unwinding to the
+    // scheduler). thread_local because tests and tools may drive dispatch from several host
+    // threads; the EE scheduler itself runs every guest thread on one executor thread.
+    thread_local uint64_t t_guestUnwinds = 0u;
+
+    bool unwindToScheduler()
+    {
+        ++t_guestUnwinds;
+        return false;
+    }
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1364,7 +1378,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
-        return false;
+        return unwindToScheduler();
     }
 
     if (!isCall)
@@ -1375,7 +1389,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
-        return false;
+        return unwindToScheduler();
     }
 
     if (!hasFunction(targetPc))
@@ -1394,17 +1408,27 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         {
             ctx->pc = targetPc;
             // if you need the app to keep open to open debug pannel change this to false
-            return false;
+            return unwindToScheduler();
         }
 
-        return false;
+        return unwindToScheduler();
     }
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t unwindsBefore = t_guestUnwinds;
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
+    {
+        return unwindToScheduler();
+    }
+
+    // A nested dispatch started unwinding to the scheduler: keep unwinding. Its resume pc can
+    // equal entryPc (recursion, e.g. A calls B, B tail-jumps to A, A calls B again and hits a
+    // checkpoint), and the check below would then take the call as finished and skip the
+    // unwound frames' epilogues, leaving $sp too low.
+    if (t_guestUnwinds != unwindsBefore)
     {
         return false;
     }
@@ -1414,7 +1438,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         ctx->pc = fallthroughPc;
     }
 
-    return ctx->pc == fallthroughPc;
+    if (ctx->pc == fallthroughPc)
+    {
+        return true;
+    }
+    return unwindToScheduler();
 }
 
 void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)

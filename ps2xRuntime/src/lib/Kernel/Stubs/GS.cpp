@@ -113,6 +113,7 @@ namespace ps2_stubs
             {
                 return;
             }
+            runtime->memory().syncGsWorker("gs stub");
 
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
@@ -1130,6 +1131,7 @@ namespace ps2_stubs
 
     void sceGsSwapDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        runtime->memory().syncGsWorker("gs stub");
         const uint32_t envAddr = getRegU32(ctx, 4);
         const uint32_t which = getRegU32(ctx, 5) & 1u;
 

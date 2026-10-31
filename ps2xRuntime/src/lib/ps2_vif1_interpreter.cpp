@@ -120,6 +120,7 @@ void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 
 void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
 {
+    syncGsWorker("direct vif0");
     if (sizeBytes == 0u)
         return;
 
@@ -308,6 +309,155 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+namespace
+{
+    // UNPACK in the formats the generic loop decodes: the same results as that loop, specialised
+    // per format. As there, components a format does not carry keep the VU memory's old value (and
+    // still get the row added in the offset/difference modes), a single component (S) is written to
+    // all four fields, and fill cycles (cl < wl) write the row where the mask selects data.
+    static_assert(PS2_VU1_DATA_SIZE == 0x400u * 16u, "UNPACK addresses wrap at 0x3FF quadwords");
+
+    template <uint32_t VN, uint32_t VL>
+    constexpr uint32_t unpackVectorBytes()
+    {
+        if constexpr (VN == 3u && VL == 3u)
+            return 2u;
+        else
+            return (VN + 1u) * (VL == 0u ? 4u : VL == 1u ? 2u : 1u);
+    }
+
+    template <uint32_t VN, uint32_t VL>
+    inline void decodeUnpackVector(const uint8_t *src, bool zeroExtend, uint32_t *v)
+    {
+        auto component = [&](uint32_t c) -> uint32_t
+        {
+            if constexpr (VL == 0u)
+            {
+                uint32_t raw;
+                std::memcpy(&raw, src + c * 4u, sizeof(raw));
+                return raw;
+            }
+            else if constexpr (VL == 1u)
+            {
+                uint16_t raw;
+                std::memcpy(&raw, src + c * 2u, sizeof(raw));
+                return zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+            }
+            else
+            {
+                const uint8_t raw = src[c];
+                return zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+            }
+        };
+        if constexpr (VN == 3u && VL == 3u)
+        {
+            uint16_t packed;
+            std::memcpy(&packed, src, sizeof(packed));
+            v[0] = packed & 0x1Fu;
+            v[1] = (packed >> 5) & 0x1Fu;
+            v[2] = (packed >> 10) & 0x1Fu;
+            v[3] = (packed >> 15) & 0x01u;
+        }
+        else if constexpr (VN == 0u)
+        {
+            v[0] = v[1] = v[2] = v[3] = component(0u);
+        }
+        else
+        {
+            for (uint32_t c = 0; c <= VN; ++c)
+                v[c] = component(c);
+        }
+    }
+
+    template <uint32_t VN, uint32_t VL>
+    void unpackFast(uint8_t *vuData, const uint8_t *src, uint32_t count, uint32_t vuAddr, uint32_t cl, uint32_t wl,
+                    bool zeroExtend, uint32_t mode, uint32_t mask, uint32_t *row, const uint32_t *col)
+    {
+        constexpr uint32_t bytes = unpackVectorBytes<VN, VL>();
+        constexpr bool canAdd = !(VN == 3u && VL == 3u);
+        const bool add = canAdd && (mode == 1u || mode == 2u);
+        // Write selection per cycle position (positions past 3 use row 3 of the mask) and field:
+        // 0 = data, 1 = row, 2 = column, 3 = write-protect.
+        uint32_t spec[4][4];
+        bool allData[4];
+        for (uint32_t c = 0; c < 4u; ++c)
+        {
+            allData[c] = true;
+            for (uint32_t f = 0; f < 4u; ++f)
+            {
+                spec[c][f] = (mask >> ((c * 4u + f) * 2u)) & 3u;
+                allData[c] = allData[c] && spec[c][f] == 0u;
+            }
+        }
+        const bool filling = cl < wl;
+        uint32_t block = 0u;
+        uint32_t cycle = 0u;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint32_t destVec = filling ? vuAddr + i : vuAddr + block + cycle;
+            uint8_t *dest = vuData + (destVec & 0x3FFu) * 16u;
+            const bool hasSource = !filling || cycle < cl;
+            const uint32_t m = cycle > 3u ? 3u : cycle;
+            uint32_t v[4];
+            std::memcpy(v, dest, sizeof(v));
+            if (hasSource && allData[m])
+            {
+                decodeUnpackVector<VN, VL>(src, zeroExtend, v);
+                if (add)
+                {
+                    for (uint32_t f = 0; f < 4u; ++f)
+                    {
+                        v[f] += row[f];
+                        if (mode == 2u)
+                            row[f] = v[f];
+                    }
+                }
+            }
+            else
+            {
+                uint32_t d[4] = {v[0], v[1], v[2], v[3]};
+                if (hasSource)
+                    decodeUnpackVector<VN, VL>(src, zeroExtend, d);
+                for (uint32_t f = 0; f < 4u; ++f)
+                {
+                    uint32_t sel = spec[m][f];
+                    if (!hasSource && sel == 0u)
+                        sel = 1u; // fill cycles write the row where the data would go
+                    if (sel == 0u)
+                    {
+                        v[f] = add ? d[f] + row[f] : d[f];
+                        if (add && mode == 2u)
+                            row[f] = v[f];
+                    }
+                    else if (sel == 1u)
+                        v[f] = row[f];
+                    else if (sel == 2u)
+                        v[f] = col[m];
+                }
+            }
+            std::memcpy(dest, v, sizeof(v));
+            if (hasSource)
+                src += bytes;
+            if (++cycle == wl)
+            {
+                cycle = 0u;
+                block += cl;
+            }
+        }
+    }
+
+    using UnpackFastFn = void (*)(uint8_t *, const uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint32_t,
+                                  uint32_t *, const uint32_t *);
+
+    // Indexed by vn * 4 + vl; null for the formats the generic loop does not decode (V2-5, V3-5, S-5).
+    constexpr UnpackFastFn kUnpackFast[16] = {
+        unpackFast<0, 0>, unpackFast<0, 1>, unpackFast<0, 2>, nullptr,
+        unpackFast<1, 0>, unpackFast<1, 1>, unpackFast<1, 2>, nullptr,
+        unpackFast<2, 0>, unpackFast<2, 1>, unpackFast<2, 2>, nullptr,
+        unpackFast<3, 0>, unpackFast<3, 1>, unpackFast<3, 2>, unpackFast<3, 3>,
+    };
+}
+
 void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
@@ -371,6 +521,7 @@ void PS2Memory::submitVif1DirectPayload(const uint8_t *data, uint32_t sizeBytes,
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
+    syncGsWorker("direct vif1");
     if (sizeBytes == 0u)
         return;
 
@@ -623,7 +774,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            const UnpackFastFn fastUnpack = s_vif1FastUnpack ? kUnpackFast[vn * 4u + vl] : nullptr;
+            if (fastUnpack && m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            {
+                fastUnpack(m_vu1Data, data + pos, writeVectorCount, vuAddr, cl, wl, zeroExtend, vif1_regs.mode & 3u,
+                           maskEnable ? vif1_regs.mask : 0u, vif1_regs.row, vif1_regs.col);
+            }
+            else if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;

@@ -166,6 +166,20 @@ namespace
         }
     }
 
+    // Unwinds to the scheduler with a resume PC equal to its own entry, as recursion does when a
+    // nested call to the same function hits an EE checkpoint.
+    void testGuestBranchNestedUnwindHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx && runtime &&
+            !runtime->dispatchGuestBranch(rdram, ctx, 0x3500u, 0x3504u, 0u,
+                                          PS2Runtime::GuestBranchKind::IndirectJump, "test-nested-jr"))
+        {
+            return;
+        }
+        if (ctx)
+            setRegU32(*ctx, 2, 0x0000DEADu);
+    }
+
     std::atomic<uint32_t> gGuestJumpTargetCount{0u};
 
     void testGuestJumpTargetHandler(uint8_t *, R5900Context *, PS2Runtime *)
@@ -453,6 +467,31 @@ void register_ps2_runtime_expansion_tests()
                       "call-like dispatch should stop caller flow when callee transfers elsewhere");
             t.Equals(ctx.pc, 0x33330000u,
                      "callee transfer PC should be preserved");
+        });
+
+        tc.Run("dispatchGuestBranch call keeps unwinding when a nested dispatch unwinds to the callee entry", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3500u, &testGuestBranchNestedUnwindHandler);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+
+            const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3500u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::IndirectCall,
+                "test-jalr-nested-unwind");
+
+            t.IsFalse(returnedToFallthrough,
+                      "a nested unwind must not be mistaken for the callee returning");
+            t.Equals(ctx.pc, 0x3500u,
+                     "the scheduler should resume at the nested unwind's target");
+            t.Equals(::getRegU32(&ctx, 2), 0u,
+                     "the callee must not continue after its nested dispatch unwound");
         });
 
         tc.Run("dispatchGuestBranch rejects missing exact targets", [](TestCase &t)

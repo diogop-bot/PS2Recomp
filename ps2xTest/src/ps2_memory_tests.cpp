@@ -410,6 +410,69 @@ void register_ps2_memory_tests()
             t.IsTrue(matches, "MPG num=0 should copy 2048 bytes into VU1 code memory");
         });
 
+        tc.Run("VIF UNPACK fast loops match the generic loop", [](TestCase &t)
+        {
+            // Random UNPACKs (every decoded format, all modes, masked or not, any cycle including fill
+            // cycles, zero/sign extension, TOPS-relative addresses, wrap-around) through both paths
+            // from the same VU memory and row.
+            uint32_t seed = 12345u;
+            auto next = [&seed]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+            static const uint8_t formats[] = {0x0, 0x1, 0x2, 0x4, 0x5, 0x6, 0x8, 0x9, 0xA, 0xC, 0xD, 0xE, 0xF};
+            std::vector<uint8_t> initialVu(PS2_VU1_DATA_SIZE);
+            bool allMatch = true;
+            for (int round = 0; round < 400 && allMatch; ++round)
+            {
+                const uint8_t format = formats[next() % sizeof(formats)];
+                const uint32_t vn = format >> 2, vl = format & 3u;
+                const uint32_t cl = 1u + next() % 8u;
+                const uint32_t wl = 1u + next() % 8u;
+                const bool masked = (next() & 1u) != 0u;
+                const uint32_t num = next() % 256u;
+                const uint32_t count = num == 0u ? 256u : num;
+                const uint16_t imm = static_cast<uint16_t>((next() & 0x3FFu) | (next() & 0xC000u));
+                const uint32_t bytesPerVector = (vn == 3u && vl == 3u) ? 2u : (vn + 1u) * (vl == 0u ? 4u : vl == 1u ? 2u : 1u);
+                uint32_t sourceCount = count;
+                if (cl < wl)
+                    sourceCount = (count / wl) * cl + std::min(count % wl, cl);
+                const uint32_t dataBytes = (sourceCount * bytesPerVector + 3u) & ~3u;
+
+                std::vector<uint8_t> packet;
+                appendU32(packet, makeVifCmd(0x01u, 0u, static_cast<uint16_t>(cl | (wl << 8)))); // STCYCL
+                appendU32(packet, makeVifCmd(0x05u, 0u, static_cast<uint16_t>(next() % 4u)));   // STMOD
+                appendU32(packet, makeVifCmd(0x30u, 0u, 0u));                                     // STROW
+                for (int i = 0; i < 4; ++i)
+                    appendU32(packet, next() * 2654435761u);
+                appendU32(packet, makeVifCmd(0x31u, 0u, 0u)); // STCOL
+                for (int i = 0; i < 4; ++i)
+                    appendU32(packet, next() * 2246822519u);
+                appendU32(packet, makeVifCmd(0x20u, 0u, 0u)); // STMASK
+                appendU32(packet, next() ^ (next() << 16));
+                appendU32(packet, makeVifCmd(static_cast<uint8_t>(0x60u | (masked ? 0x10u : 0u) | format), static_cast<uint8_t>(num), imm));
+                for (uint32_t i = 0; i < dataBytes; ++i)
+                    packet.push_back(static_cast<uint8_t>(next()));
+                for (auto &b : initialVu)
+                    b = static_cast<uint8_t>(next());
+
+                PS2Memory fast, generic;
+                t.IsTrue(fast.initialize() && generic.initialize(), "PS2Memory initialize should succeed");
+                const uint32_t tops = next() & 0x3FFu;
+                for (PS2Memory *mem : {&fast, &generic})
+                {
+                    std::memcpy(mem->getVU1Data(), initialVu.data(), PS2_VU1_DATA_SIZE);
+                    mem->vif1_regs.tops = tops;
+                }
+                PS2Memory::s_vif1FastUnpack = true;
+                fast.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+                PS2Memory::s_vif1FastUnpack = false;
+                generic.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+                PS2Memory::s_vif1FastUnpack = true;
+
+                allMatch = std::memcmp(fast.getVU1Data(), generic.getVU1Data(), PS2_VU1_DATA_SIZE) == 0 &&
+                           std::memcmp(fast.vif1_regs.row, generic.vif1_regs.row, sizeof(fast.vif1_regs.row)) == 0;
+            }
+            t.IsTrue(allMatch, "fast UNPACK should leave the same VU1 memory and row registers as the generic loop");
+        });
+
         tc.Run("VIF UNPACK num zero uploads 256 vectors", [](TestCase &t)
         {
             PS2Memory mem;
