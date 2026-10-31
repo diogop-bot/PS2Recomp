@@ -5,6 +5,14 @@
 
 namespace ps2_stubs
 {
+    bool readCdSectorsForIop(uint32_t lsn, uint32_t sectors, void *destination, size_t size)
+    {
+        if (lsn < 0x00100000u || sectors == 0u ||
+            size != static_cast<uint64_t>(sectors) * 2048u || !destination)
+            return false;
+        return readCdSectors(lsn, sectors, static_cast<uint8_t *>(destination), size);
+    }
+
     namespace
     {
         constexpr uint32_t kCdStreamBlocking = 1u;

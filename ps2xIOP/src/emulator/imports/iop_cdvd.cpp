@@ -661,13 +661,18 @@ namespace ps2x::iop::detail
             const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
             if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
             {
+                if (std::getenv("MC_AUDIO_TRACE"))
+                    host.log(LogLevel::Warning, "[mc_sound:cdread] rejected lsn=" +
+                        std::to_string(lsn) + " sectors=" + std::to_string(sectors) +
+                        " destination=" + std::to_string(destination) +
+                        " bytes=" + std::to_string(byteCount64));
                 lastError = kCdvdErrorRead;
                 return false;
             }
             const size_t byteCount = static_cast<size_t>(byteCount64);
             std::vector<uint8_t> bytes(byteCount, 0u);
 
-            bool read = false;
+            bool read = host.readCdSectors(lsn, sectors, bytes.data(), byteCount);
             const std::string imagePath = host.hostPath(HostPathKind::CdImage);
             if (!imagePath.empty())
             {
@@ -700,6 +705,10 @@ namespace ps2x::iop::detail
 
             if (!read || !memory.writeRam(destination, bytes.data(), bytes.size()))
             {
+                if (std::getenv("MC_AUDIO_TRACE"))
+                    host.log(LogLevel::Warning, "[mc_sound:cdread] data unavailable lsn=" +
+                        std::to_string(lsn) + " sectors=" + std::to_string(sectors) +
+                        " image=" + imagePath);
                 lastError = kCdvdErrorRead;
                 return false;
             }

@@ -9,6 +9,7 @@ namespace ps2x::iop::detail
 {
     struct IopCpuState;
     class IopGuestExecutor;
+    class IopIntrman;
 
     class IopTimrman
     {
@@ -16,7 +17,7 @@ namespace ps2x::iop::detail
         void reset() noexcept;
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
-        void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
+        void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, IopIntrman *intrman = nullptr);
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
         // Running timers (source, prescale, compare, handler calls since the last summary), for profiling.
         [[nodiscard]] std::string debugSummary();

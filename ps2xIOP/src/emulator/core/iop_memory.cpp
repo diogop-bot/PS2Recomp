@@ -35,11 +35,12 @@ namespace ps2x::iop::detail
         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
         m_hardware.clear();
         m_allocations.clear();
-        m_heapCursor = HeapBase;
         m_interruptStatus = 0;
         m_interruptMask = 0;
         m_interruptControl = 1;
         m_dmaStart.reset();
+        m_spu2DmaStatus = {};
+        m_spu2DmaTimed = {};
     }
 
     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
@@ -50,6 +51,10 @@ namespace ps2x::iop::detail
     uint8_t IopMemory::read8(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2 && phys >= Spu2Base && phys < Spu2End)
+        {
+            return static_cast<uint8_t>(read16(phys & ~1u) >> ((phys & 1u) * 8u));
+        }
         if (phys < RamSize)
             return m_ram[phys];
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
@@ -61,6 +66,13 @@ namespace ps2x::iop::detail
     uint16_t IopMemory::read16(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2 && phys >= Spu2Base && phys < Spu2End)
+        {
+            const uint16_t value = m_spu2->read16(phys, *m_cycles);
+            if (phys == 0x1F900344u || phys == 0x1F900744u)
+                return value | (m_spu2DmaStatus[phys == 0x1F900744u ? 1 : 0] ? 0x80u : 0u);
+            return value;
+        }
         if (phys + 1u < RamSize)
         {
             uint16_t value;
@@ -73,6 +85,10 @@ namespace ps2x::iop::detail
     uint32_t IopMemory::read32(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2 && phys >= Spu2Base && phys < Spu2End)
+        {
+            return read16(phys) | (uint32_t(read16(phys + 2u)) << 16);
+        }
         if ((phys & 3u) == 0u && phys + 3u < RamSize)
         {
             uint32_t value;
@@ -97,6 +113,13 @@ namespace ps2x::iop::detail
     void IopMemory::write8(uint32_t address, uint8_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2 && phys >= Spu2Base && phys < Spu2End)
+        {
+            const uint32_t shift = (phys & 1u) * 8u;
+            const uint16_t old = m_spu2->read16(phys & ~1u, *m_cycles);
+            m_spu2->write16(phys & ~1u, uint16_t((old & ~(0xffu << shift)) | (uint32_t(value) << shift)), *m_cycles);
+            return;
+        }
         if (phys < RamSize)
         {
             m_ram[phys] = value;
@@ -118,6 +141,11 @@ namespace ps2x::iop::detail
     void IopMemory::write16(uint32_t address, uint16_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2 && phys >= Spu2Base && phys < Spu2End)
+        {
+            m_spu2->write16(phys, value, *m_cycles);
+            return;
+        }
         if (phys + 1u < RamSize)
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
@@ -131,6 +159,12 @@ namespace ps2x::iop::detail
     void IopMemory::write32(uint32_t address, uint32_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2 && phys >= Spu2Base && phys < Spu2End)
+        {
+            m_spu2->write16(phys, uint16_t(value), *m_cycles);
+            m_spu2->write16(phys + 2, uint16_t(value >> 16), *m_cycles);
+            return;
+        }
         if ((phys & 3u) == 0u && phys + 3u < RamSize)
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
@@ -254,16 +288,19 @@ namespace ps2x::iop::detail
             return;
 
         const bool secondCore = address == kDmaSpu1Chcr;
-        m_hardware[address] = value & ~kDmaStart;
-
-        const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
-        const uint32_t alignedStatus = statusAddress & ~3u;
-        const uint32_t shift = (statusAddress & 2u) * 8u;
-        uint32_t status = 0u;
-        if (const auto current = m_hardware.find(alignedStatus); current != m_hardware.end())
-            status = current->second;
-        status |= 0x80u << shift;
-        m_hardware[alignedStatus] = status;
+        const unsigned core = secondCore ? 1u : 0u;
+        m_spu2DmaStatus[core] = 0;
+        m_spu2DmaTimed[core] = 0;
+        const bool deviceAccepted = m_spu2 && m_spu2->dma(core,
+                readHardware32(address - 8u), readHardware32(address - 4u), value, m_ram, *m_cycles);
+        if (!deviceAccepted)
+        {
+            m_hardware[address] = value & ~kDmaStart;
+            const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
+            const uint32_t alignedStatus = statusAddress & ~3u;
+            const uint32_t shift = (statusAddress & 2u) * 8u;
+            m_hardware[alignedStatus] = readHardware32(alignedStatus) | (0x80u << shift);
+        }
 
         const uint32_t blockControlAddress = address - sizeof(uint32_t);
         uint32_t blockControl = 0u;
@@ -276,14 +313,29 @@ namespace ps2x::iop::detail
         // pulls one 32-bit stereo sample per 48 kHz tick, so the transfer drains at playback rate.
         // Completing it at bus speed would make a streaming driver refill as fast as the IOP runs.
         const uint32_t admasAddress = secondCore ? kSpu2Core1Admas : kSpu2Core0Admas;
-        uint32_t admas = 0u;
-        if (const auto current = m_hardware.find(admasAddress); current != m_hardware.end())
-            admas = current->second & 0xFFFFu;
+        uint32_t admas = m_spu2 ? m_spu2->read16(admasAddress, *m_cycles) : 0u;
+        if (!m_spu2)
+            if (const auto current = m_hardware.find(admasAddress); current != m_hardware.end())
+                admas = current->second & 0xFFFFu;
         const bool autoDma = (admas & (secondCore ? 2u : 1u)) != 0u;
+        // PCSX2 reports AutoDMA when the playback buffer is consumed. The
+        // bridge finishes ordinary bank copies synchronously before this
+        // bus-paced guest completion can release/reuse the IOP source buffer.
+        if (deviceAccepted && autoDma)
+            return;
+        m_spu2DmaTimed[core] = deviceAccepted ? 1u : 0u;
         m_dmaStart = DmaStart{
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
             autoDma ? transferWords * kIopCyclesPerSpuSample : std::max<uint64_t>(transferWords * 2u, 64u),
         };
+    }
+
+    void IopMemory::completeSpu2Dma(unsigned core)
+    {
+        const uint32_t chcr = core ? kDmaSpu1Chcr : kDmaSpu0Chcr;
+        m_hardware[chcr] &= ~kDmaStart;
+        if (core < m_spu2DmaStatus.size())
+            m_spu2DmaStatus[core] = 1;
     }
 
     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept
@@ -310,7 +362,9 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        // Modules and SIF callers free temporary buffers. Search from the heap
+        // base so those holes remain usable instead of exhausting a bump cursor.
+        uint32_t candidate = alignUp(HeapBase, alignment);
         for (;;)
         {
             bool overlap = false;
@@ -330,7 +384,6 @@ namespace ps2x::iop::detail
             return 0u;
         m_allocations.push_back({candidate, size});
         markOwned(candidate, size);
-        m_heapCursor = std::max(m_heapCursor, candidate + size);
         return candidate;
     }
 
@@ -350,7 +403,17 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        auto blocks = m_allocations;
+        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b)
+                  { return a.address < b.address; });
+        uint32_t cursor = HeapBase, largest = 0;
+        for (const auto &block : blocks)
+        {
+            if (block.address > cursor)
+                largest = std::max(largest, block.address - cursor);
+            cursor = std::max(cursor, block.address + block.size);
+        }
+        return std::max(largest, HeapLimit - cursor);
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

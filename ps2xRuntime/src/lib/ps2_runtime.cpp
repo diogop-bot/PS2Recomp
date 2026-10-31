@@ -611,6 +611,11 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
     m_iopSubsystem->runEeCycles(eeCycles);
 }
 
+void PS2Runtime::setIopSpu2Device(std::shared_ptr<ps2x::iop::Spu2Device> device)
+{
+    m_iopSubsystem->setSpu2Device(std::move(device));
+}
+
 void PS2Runtime::resetIop()
 {
     m_iopSubsystem->reset();

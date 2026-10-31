@@ -1,5 +1,6 @@
 #ifndef PS2_RUNTIME_H
 #define PS2_RUNTIME_H
+#include "ps2x/iop/spu2_device.h"
 
 #include <cstring>
 #include <cstdint>
@@ -453,6 +454,7 @@ public:
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
     inline PS2RomDevice &romDevice() { return m_romDevice; }
     inline const PS2RomDevice &romDevice() const { return m_romDevice; }
+    void setIopSpu2Device(std::shared_ptr<ps2x::iop::Spu2Device> device);
     inline PS2Vfs &vfs() { return m_vfs; }
     inline const PS2Vfs &vfs() const { return m_vfs; }
 

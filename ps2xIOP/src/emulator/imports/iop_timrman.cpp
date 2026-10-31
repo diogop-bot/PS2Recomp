@@ -1,10 +1,13 @@
 #include "iop_timrman.h"
+#include "iop_intrman.h"
 
 #include "../core/iop_cpu.h"
 #include "../services/iop_rpc.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 
@@ -124,7 +127,7 @@ namespace ps2x::iop::detail
         timer.counterBase = static_cast<uint32_t>(current);
         timer.counterBaseCycle = currentCycle;
 
-        if (timer.compareCallback.function != 0u)
+        if (timer.compare != 0u || timer.compareCallback.function != 0u)
         {
             const uint64_t modulus = timer.width == 16u ? (1ull << 16u) : (1ull << 32u);
             const uint64_t compare = timer.width == 16u ? (timer.compare & 0xFFFFu) : timer.compare;
@@ -177,6 +180,9 @@ namespace ps2x::iop::detail
                 timer.source = a0;
                 timer.prescale = std::max(a2, 1u);
                 timer.counterBaseCycle = currentCycle;
+                if (std::getenv("MC_AUDIO_TRACE") && a0 == 4u)
+                    std::fprintf(stderr, "[mc_sound:timer] alloc source=%u width=%u irq=%u id=0x%x\n",
+                                 a0, a1, timer.irq, timerId(index));
                 setV0(timerId(index));
                 return true;
             }
@@ -236,6 +242,10 @@ namespace ps2x::iop::detail
                 timer->running = true;
                 timer->counterBaseCycle = currentCycle;
                 schedule(*timer, currentCycle);
+                if (std::getenv("MC_AUDIO_TRACE") && timer->source == 4u)
+                    std::fprintf(stderr, "[mc_sound:timer] start irq=%u mode=0x%x compare=%u next=%llu\n",
+                                 timer->irq, a1, timer->compare,
+                                 static_cast<unsigned long long>(timer->compareCycle));
             }
             setV0(0u);
             return true;
@@ -243,8 +253,10 @@ namespace ps2x::iop::detail
         case 8: // GetTimerStatus
         case 17: // GetTimerMode
         {
-            const Timer *timer = timerFromId(a0);
+            Timer *timer = timerFromId(a0);
             setV0(timer ? timer->liveMode : errorValue(kIllegalTimerId));
+            if (timer && ordinal == 8u)
+                timer->liveMode &= ~0x1800u; // Acknowledge compare/overflow flags.
             return true;
         }
         case 9: // SetTimerCounter
@@ -415,7 +427,7 @@ namespace ps2x::iop::detail
         }
     }
 
-    void IopTimrman::serviceDue(uint64_t currentCycle, IopGuestExecutor &executor)
+    void IopTimrman::serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, IopIntrman *intrman)
     {
         if (m_servicing)
             return;
@@ -436,19 +448,29 @@ namespace ps2x::iop::detail
             if (!compareDue && !overflowDue)
                 continue;
 
+            timer.liveMode |= compareDue ? 0x800u : 0x1000u;
+
             const Callback callback = compareDue ? timer.compareCallback : timer.overflowCallback;
             ++timer.handlerCalls;
             timer.compareCycle = UINT64_MAX;
             timer.overflowCycle = UINT64_MAX;
-            const uint32_t result = callback.function != 0u
-                                        ? executor.executeGuestFunctionWithBudget(callback.function,
-                                                                                  callback.common,
-                                                                                  0u,
-                                                                                  0u,
-                                                                                  0u,
-                                                                                  callback.gp,
-                                                                                  100000u)
-                                        : 0u;
+            uint32_t result = 0u;
+            if (callback.function != 0u)
+                result = executor.executeGuestFunctionWithBudget(callback.function,
+                                                                 callback.common,
+                                                                 0u, 0u, 0u,
+                                                                 callback.gp, 100000u);
+            else if (intrman)
+            {
+                // A hardware timer can use intrman instead of SetTimerHandler.
+                // Its IRQ return value does not control whether the timer repeats.
+                const bool delivered = intrman->dispatchInterrupt(timer.irq, executor);
+                if (std::getenv("MC_AUDIO_TRACE") && timer.source == 4u && timer.handlerCalls <= 6u)
+                    std::fprintf(stderr, "[mc_sound:timer] due irq=%u delivered=%u cycle=%llu\n",
+                                 timer.irq, delivered,
+                                 static_cast<unsigned long long>(currentCycle));
+                result = compareDue ? timer.compare : 1u;
+            }
             if (!timer.running)
                 continue;
             if (result == 0u)
@@ -456,7 +478,7 @@ namespace ps2x::iop::detail
                 stop(timer, currentCycle);
                 continue;
             }
-            if (compareDue)
+            if (compareDue && callback.function != 0u)
                 timer.compare = timer.width == 16u ? (result & 0xFFFFu) : result;
             timer.counterBase = 0u;
             timer.counterBaseCycle = currentCycle;

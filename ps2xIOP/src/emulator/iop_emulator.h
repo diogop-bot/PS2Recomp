@@ -1,9 +1,11 @@
 #pragma once
 
 #include "ps2x/iop/iop_host.h"
+#include "ps2x/iop/spu2_device.h"
 #include "ps2x/iop/iop_types.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -21,6 +23,10 @@ namespace ps2x::iop::detail
         IopEmulator &operator=(const IopEmulator &) = delete;
 
         void reset();
+        void setSpu2Device(std::shared_ptr<Spu2Device> device);
+        // Optional monotonic host clock in nanoseconds. Empty restores EE timing.
+        // Injection also lets embedders/tests advance time without sleeping.
+        void setRealtimeClock(std::function<uint64_t()> clock);
         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);

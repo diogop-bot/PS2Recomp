@@ -21,6 +21,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <span>
@@ -182,6 +183,9 @@ namespace ps2x::iop::detail
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
+            resetClockAnchor();
+            nextSpu2Tick = 0;
+            if (spu2) spu2->reset(0);
             totalInstructions = 0;
             eeCycleCarry = 0;
             idleUntil = 0;
@@ -226,6 +230,54 @@ namespace ps2x::iop::detail
         {
             memory.write32(address, value);
             schedulePendingDma();
+        }
+
+        void resetClockAnchor()
+        {
+            clockBaseNanos = lastClockNanos = wallClock ? wallClock() : 0;
+            clockBaseCycles = totalCycles;
+            eeBeforeClockSample = 0;
+        }
+
+        void runWallCycles(uint64_t eeCycles) noexcept
+        {
+            // Checkpoints are frequent. Sample the host clock only every 8K EE
+            // cycles, then budget against absolute elapsed time, not frame count.
+            eeBeforeClockSample += eeCycles;
+            if (advancingWallClock || eeBeforeClockSample < 8192) return;
+            eeBeforeClockSample = 0;
+            const uint64_t now = wallClock();
+            if (now < lastClockNanos || now - lastClockNanos > 1'000'000'000ull)
+            {
+                // Suspend/debugger/long blocking load: do not synthesize seconds
+                // of queued audio in a burst when the game resumes.
+                clockBaseNanos = lastClockNanos = now;
+                clockBaseCycles = totalCycles;
+                return;
+            }
+            lastClockNanos = now;
+            const uint64_t elapsed = now - clockBaseNanos;
+            const uint64_t target = clockBaseCycles + (elapsed / 1'000'000'000ull) * 36'864'000ull +
+                ((elapsed % 1'000'000'000ull) * 36'864'000ull) / 1'000'000'000ull;
+            if (target <= totalCycles) return;
+            advancingWallClock = true;
+            runCycles(target - totalCycles);
+            advancingWallClock = false;
+        }
+
+        void tickSpu2()
+        {
+            if (!spu2 || totalCycles < nextSpu2Tick) return;
+            nextSpu2Tick = totalCycles + 768;
+            const uint32_t events = spu2->tick(totalCycles);
+            if (events & 1u) pendingDmaInterrupts[9] = totalCycles;
+            for (unsigned core = 0; core < 2; ++core)
+                if (events & (2u << core))
+                {
+                    if (memory.usesTimedSpu2Dma(core)) continue;
+                    memory.completeSpu2Dma(core);
+                    pendingDmaInterrupts[core ? 40 : 36] = totalCycles;
+                }
         }
 
         void schedulePendingDma()
@@ -414,6 +466,7 @@ namespace ps2x::iop::detail
 
         bool step(CpuState &cpu)
         {
+            tickSpu2();
             if (cpu.stopped)
                 return false;
             if (cpu.pc == kThreadReturnSentinel || cpu.pc == kCallReturnSentinel)
@@ -518,7 +571,30 @@ namespace ps2x::iop::detail
                 cpu.gpr[29] = kCallStackBase - 32u;
             }
             cpu.gpr[31] = kCallReturnSentinel;
-            runCpu(cpu, budget);
+            const uint32_t executed = runCpu(cpu, budget);
+            if (std::getenv("MC_AUDIO_TRACE") && cpu.pc != kCallReturnSentinel)
+            {
+                static uint32_t incompleteCalls = 0;
+                if (incompleteCalls++ < 24)
+                {
+                    std::ostringstream out;
+                    out << "[mc_sound:iop-call] incomplete function=0x" << std::hex << address
+                        << " pc=0x" << cpu.pc << " code=";
+                    for (int offset = -12; offset <= 12; offset += 4)
+                        out << ' ' << memory.read32(cpu.pc + offset);
+                    out << " v0=0x" << cpu.gpr[2] << " a0=0x" << cpu.gpr[4]
+                        << " a1=0x" << cpu.gpr[5] << " s0=0x" << cpu.gpr[16]
+                        << " ra=0x" << cpu.gpr[31]
+                        << " dma7chcr=0x" << memory.read32(0x1F801508u)
+                        << " dma7bcr=0x" << memory.read32(0x1F801504u)
+                        << " dma7madr=0x" << memory.read32(0x1F801500u)
+                        << " dma7admas=0x" << memory.read16(0x1F9005B0u)
+                        << " dma7status=0x" << memory.read16(0x1F900744u)
+                        << " libsdflag=0x" << memory.read16(0x209D6u) << std::dec
+                        << " instructions=" << executed << " budget=" << budget;
+                    log(LogLevel::Warning, out.str());
+                }
+            }
             return cpu.gpr[2];
         }
 
@@ -565,7 +641,11 @@ namespace ps2x::iop::detail
             try
             {
                 for (const int irq : completed)
+                {
+                    if ((irq == 36 || irq == 40) && memory.usesTimedSpu2Dma(irq == 40 ? 1u : 0u))
+                        memory.completeSpu2Dma(irq == 40 ? 1u : 0u);
                     (void)intrman.dispatchInterrupt(irq, *this);
+                }
             }
             catch (...)
             {
@@ -625,9 +705,10 @@ namespace ps2x::iop::detail
                 {
                     if (profile.enabled)
                         ++profile.loops;
+                    tickSpu2();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
-                    timrman.serviceDue(totalCycles, *this);
+                    timrman.serviceDue(totalCycles, *this, &intrman);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
@@ -637,6 +718,7 @@ namespace ps2x::iop::detail
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        if (spu2) nextWake = std::min(nextWake, nextSpu2Tick);
                         idleUntil = nextWake;
                         const uint64_t skipTo = std::max(totalCycles + 1u, std::min(target, nextWake));
                         if (profile.enabled)
@@ -780,6 +862,11 @@ namespace ps2x::iop::detail
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
+        std::shared_ptr<Spu2Device> spu2;
+        std::function<uint64_t()> wallClock;
+        uint64_t clockBaseNanos = 0, lastClockNanos = 0, clockBaseCycles = 0, eeBeforeClockSample = 0;
+        bool advancingWallClock = false;
+        uint64_t nextSpu2Tick = 0;
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
@@ -826,8 +913,39 @@ namespace ps2x::iop::detail
         return m_impl->stopModule(moduleId, result);
     }
 
+    void IopEmulator::setSpu2Device(std::shared_ptr<Spu2Device> device)
+    {
+        m_impl->spu2 = std::move(device);
+        m_impl->memory.setSpu2Device(m_impl->spu2, &m_impl->totalCycles);
+        m_impl->pendingDmaInterrupts.erase(36);
+        m_impl->pendingDmaInterrupts.erase(40);
+        m_impl->pendingDmaInterrupts.erase(9);
+        m_impl->idleUntil = 0;
+        m_impl->nextSpu2Tick = m_impl->totalCycles;
+        if (m_impl->spu2) m_impl->spu2->reset(m_impl->totalCycles);
+        const char *clock = std::getenv("PS2X_IOP_CLOCK");
+        if (m_impl->spu2 && clock && std::strcmp(clock, "wall") == 0)
+            setRealtimeClock([] {
+                return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            });
+        else
+            setRealtimeClock({});
+    }
+
+    void IopEmulator::setRealtimeClock(std::function<uint64_t()> clock)
+    {
+        m_impl->wallClock = std::move(clock);
+        m_impl->resetClockAnchor();
+    }
+
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
+        if (m_impl->wallClock)
+        {
+            m_impl->runWallCycles(eeCycles);
+            return;
+        }
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;

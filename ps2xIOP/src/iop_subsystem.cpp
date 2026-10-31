@@ -97,6 +97,11 @@ namespace ps2x::iop
     IopSubsystem::IopSubsystem(IopSubsystem &&) noexcept = default;
     IopSubsystem &IopSubsystem::operator=(IopSubsystem &&) noexcept = default;
 
+    void IopSubsystem::setSpu2Device(std::shared_ptr<Spu2Device> device)
+    {
+        m_impl->emulator.setSpu2Device(std::move(device));
+    }
+
     void IopSubsystem::reset()
     {
         m_impl->moduleManager.reset();

@@ -221,6 +221,10 @@ namespace ps2x::iop::detail
             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
             server.queue = m_memory.read32(stackPointer + 24u);
             m_servers[server.sid] = server;
+            if (std::getenv("MC_AUDIO_TRACE"))
+                m_host.log(LogLevel::Info, "[mc_sound:iop-rpc] register sid=" +
+                    std::to_string(server.sid) + " function=" + std::to_string(server.function) +
+                    " buffer=" + std::to_string(server.buffer));
             if (server.serverData != 0u)
             {
                 m_memory.write32(server.serverData + 0x20u, server.sid);
@@ -287,8 +291,10 @@ namespace ps2x::iop::detail
             if (copySize != 0u)
             {
                 std::vector<uint8_t> payload(copySize);
-                if (m_host.readGuest(request.send.address, payload.data(), payload.size()))
-                    (void)m_memory.writeRam(server.buffer, payload.data(), payload.size());
+                if (!m_host.readGuest(request.send.address, payload.data(), payload.size()) ||
+                    !m_memory.writeRam(server.buffer, payload.data(), payload.size()))
+                    m_host.log(LogLevel::Warning, "[IOP RPC] failed EE-to-IOP request copy sid=" +
+                        std::to_string(request.sid) + " function=" + std::to_string(request.function));
             }
         }
 
@@ -306,7 +312,9 @@ namespace ps2x::iop::detail
             if (physical < IopMemory::RamSize)
             {
                 const uint32_t copySize = std::min<uint32_t>(request.receive.size, IopMemory::RamSize - physical);
-                (void)m_host.writeGuest(request.receive.address, m_memory.ram().data() + physical, copySize);
+                if (!m_host.writeGuest(request.receive.address, m_memory.ram().data() + physical, copySize))
+                    m_host.log(LogLevel::Warning, "[IOP RPC] failed IOP-to-EE reply copy sid=" +
+                        std::to_string(request.sid) + " function=" + std::to_string(request.function));
                 if (copySize < request.receive.size)
                     (void)m_host.zeroGuest(request.receive.address + copySize, request.receive.size - copySize);
             }

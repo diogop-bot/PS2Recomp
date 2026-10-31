@@ -24,6 +24,18 @@ namespace ps2_syscalls
 
         void pushSifRpcDebugEvent(SifRpcDebugEvent event)
         {
+            if (std::getenv("MC_AUDIO_TRACE") && event.op &&
+                (std::strcmp(event.op, "CallRpc") == 0 || std::strcmp(event.op, "BindRpc") == 0))
+            {
+                static std::unordered_set<uint64_t> shown;
+                const uint64_t signature = (static_cast<uint64_t>(event.sid) << 32u) |
+                    (std::strcmp(event.op, "CallRpc") == 0 ? event.rpcNum : 0xffffffffu);
+                if (shown.size() < 96u && shown.insert(signature).second)
+                    std::cerr << "[mc_sound:rpc] " << event.op << " sid=0x" << std::hex << event.sid
+                              << " fn=0x" << event.rpcNum << " send=0x" << event.sendSize
+                              << " recv=0x" << event.recvSize << " flags=0x" << event.flags
+                              << std::dec << " result=" << event.result << '\n';
+            }
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
             pushSifRpcDebugEventLocked(event);
         }
@@ -502,6 +514,25 @@ namespace ps2_syscalls
         }
 
         const uint32_t serverPtr = client->server;
+        if (sid == 0x12346u && std::getenv("MC_AUDIO_TRACE"))
+        {
+            static std::unordered_map<uint32_t, unsigned> samples;
+            unsigned &count = samples[rpcNum];
+            if (count < 8u && sendSize >= 4u && sendBuf != 0u)
+            {
+                const auto *payload = reinterpret_cast<const uint32_t *>(getMemPtr(rdram, sendBuf));
+                if (payload)
+                {
+                    std::cerr << "[mc_sound:audio-rpc] fn=0x" << std::hex << rpcNum
+                              << " arg0=0x" << payload[0]
+                              << " arg1=0x" << (sendSize >= 8u ? payload[1] : 0u)
+                              << " arg2=0x" << (sendSize >= 12u ? payload[2] : 0u)
+                              << " arg3=0x" << (sendSize >= 16u ? payload[3] : 0u)
+                              << std::dec << " sample=" << count << '\n';
+                }
+            }
+            ++count;
+        }
         auto *server = serverPtr
                            ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr))
                            : nullptr;
@@ -605,6 +636,26 @@ namespace ps2_syscalls
                     rpcZeroRdram(rdram, receiveBuffer, receiveSize);
                     zeroedFallback = true;
                 }
+            }
+
+            if (sid == 0x12346u && std::getenv("MC_AUDIO_TRACE") &&
+                (rpcNum == 0x8210u || rpcNum == 0x8280u || rpcNum == 0x8030u ||
+                 rpcNum == 0x8060u || rpcNum == 0x8270u || rpcNum == 0x80b0u ||
+                 rpcNum == 0x8000u))
+            {
+                static std::unordered_map<uint32_t, unsigned> replySamples;
+                unsigned &count = replySamples[rpcNum];
+                if (count < 8u && receiveBuffer != 0u && receiveSize >= 4u)
+                {
+                    const auto *reply = reinterpret_cast<const uint32_t *>(getMemPtr(rdram, receiveBuffer));
+                    if (reply)
+                        std::cerr << "[mc_sound:audio-reply] fn=0x" << std::hex << rpcNum
+                                  << " out0=0x" << reply[0]
+                                  << " out1=0x" << (receiveSize >= 8u ? reply[1] : 0u)
+                                  << " out2=0x" << (receiveSize >= 12u ? reply[2] : 0u)
+                                  << " handled=" << handled << std::dec << " sample=" << count << '\n';
+                }
+                ++count;
             }
 
             auto completeClient = [=](R5900Context &base, bool callbackCompleted)

@@ -1,5 +1,8 @@
 #pragma once
 
+#include "ps2x/iop/spu2_device.h"
+#include <array>
+#include <memory>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -22,7 +25,9 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // Keep a full MiB for IRX code (the loader rejects crossing this line),
+        // leaving enough of the real 2 MiB RAM for resident drivers and streams.
+        static constexpr uint32_t HeapBase = 0x00100000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
@@ -40,6 +45,9 @@ namespace ps2x::iop::detail
         IopMemory();
 
         void reset();
+        void setSpu2Device(std::shared_ptr<Spu2Device> device, const uint64_t *cycles) { m_spu2 = std::move(device); m_cycles = cycles; m_spu2DmaStatus = {}; m_spu2DmaTimed = {}; }
+        void completeSpu2Dma(unsigned core);
+        [[nodiscard]] bool usesTimedSpu2Dma(unsigned core) const { return core < m_spu2DmaTimed.size() && m_spu2DmaTimed[core]; }
 
         [[nodiscard]] uint8_t read8(uint32_t address) const;
         [[nodiscard]] uint16_t read16(uint32_t address) const;
@@ -77,12 +85,15 @@ namespace ps2x::iop::detail
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
 
+        std::shared_ptr<Spu2Device> m_spu2;
+        std::array<uint8_t, 2> m_spu2DmaStatus{};
+        std::array<uint8_t, 2> m_spu2DmaTimed{};
+        const uint64_t *m_cycles = nullptr;
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;
         std::vector<uint8_t> m_scratch;
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
-        uint32_t m_heapCursor = HeapBase;
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;

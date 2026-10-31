@@ -3,6 +3,7 @@
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
+#include "Kernel/Stubs/CD.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
@@ -284,6 +285,11 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
     default:
         return paths.elfDirectory.string();
     }
+}
+
+bool PS2IopHostAdapter::readCdSectors(uint32_t lsn, uint32_t sectors, void *destination, size_t size) const
+{
+    return ps2_stubs::readCdSectorsForIop(lsn, sectors, destination, size);
 }
 
 std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const

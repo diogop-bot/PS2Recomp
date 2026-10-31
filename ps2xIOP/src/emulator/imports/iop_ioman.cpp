@@ -193,7 +193,13 @@ namespace ps2x::iop::detail
 
         const size_t wanted = static_cast<size_t>(std::min<uint64_t>(size, file.size - file.position));
         if (!m_memory.ownsRamRange(buffer, wanted))
+        {
+            static unsigned failures = 0;
+            if (failures++ < 16)
+                m_host.log(LogLevel::Warning, "[IOP ioman] read buffer not owned: " + file.path +
+                    " buffer=" + std::to_string(buffer) + " bytes=" + std::to_string(wanted));
             return kEfault;
+        }
         std::vector<uint8_t> bytes(wanted);
         size_t bytesRead = 0u;
         if (!m_host.readHostFile(file.handle, file.position, bytes.data(), wanted, bytesRead) ||

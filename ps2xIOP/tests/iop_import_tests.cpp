@@ -4,6 +4,7 @@
 #include "emulator/imports/iop_cdvd.h"
 #include "emulator/imports/iop_imports.h"
 #include "emulator/imports/iop_ioman.h"
+#include "emulator/imports/iop_intrman.h"
 #include "emulator/imports/iop_loadcore.h"
 #include "emulator/imports/iop_timrman.h"
 #include "emulator/services/iop_rpc.h"
@@ -463,12 +464,71 @@ namespace
                expect(executor.lastGp == 0x89AB0u, "timer callback lost the registering module GP") &&
                expect(timrman.nextEventCycle(1000u) == 300u, "timer callback return did not rearm compare");
     }
+
+    bool testTimrmanHardwareInterruptRepeats()
+    {
+        IopMemory memory;
+        IopIntrman intrman(memory);
+        IopTimrman timrman;
+        timrman.reset();
+        RecordingExecutor executor;
+        IopCpuState cpu{};
+
+        cpu.gpr[4] = 4u; // HLINE source, 16-bit timer with IRQ 5.
+        cpu.gpr[5] = 16u;
+        cpu.gpr[6] = 1u;
+        if (!expect(timrman.dispatchImport(4u, cpu, 100u), "audio timer allocation failed"))
+            return false;
+        const uint32_t id = cpu.gpr[2];
+
+        cpu = {};
+        cpu.gpr[4] = 5u;
+        cpu.gpr[5] = 1u;
+        cpu.gpr[6] = 0x12340u;
+        cpu.gpr[7] = 0x45670u;
+        cpu.gpr[28] = 0x89AB0u;
+        if (!expect(intrman.dispatchImport(4u, cpu, executor), "audio timer IRQ registration failed"))
+            return false;
+        cpu = {};
+        cpu.gpr[4] = 5u;
+        if (!expect(intrman.dispatchImport(6u, cpu, executor), "audio timer IRQ enable failed"))
+            return false;
+
+        cpu = {};
+        cpu.gpr[4] = id;
+        cpu.gpr[5] = 66u;
+        if (!expect(timrman.dispatchImport(11u, cpu, 100u), "audio timer compare failed"))
+            return false;
+        cpu = {};
+        cpu.gpr[4] = id;
+        cpu.gpr[5] = 0x158u;
+        if (!expect(timrman.dispatchImport(7u, cpu, 100u), "audio timer start failed"))
+            return false;
+        const uint64_t first = timrman.nextEventCycle(UINT64_MAX);
+        timrman.serviceDue(first, executor, &intrman);
+        cpu = {};
+        cpu.gpr[4] = id;
+        if (!expect(timrman.dispatchImport(8u, cpu, first), "timer status read failed") ||
+            !expect((cpu.gpr[2] & 0x800u) != 0u, "compare status was not raised"))
+            return false;
+        cpu = {};
+        cpu.gpr[4] = id;
+        if (!expect(timrman.dispatchImport(8u, cpu, first), "timer status acknowledge failed") ||
+            !expect((cpu.gpr[2] & 0x800u) == 0u, "compare status was not acknowledged"))
+            return false;
+        const uint64_t second = timrman.nextEventCycle(UINT64_MAX);
+        timrman.serviceDue(second, executor, &intrman);
+        return expect(executor.calls == 2u, "hardware timer IRQ did not repeat") &&
+               expect(executor.lastAddress == 0x12340u, "hardware timer called wrong IRQ handler") &&
+               expect(second > first, "hardware timer did not reschedule");
+    }
 }
 
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testIomanReadOnlyFile() || !testTimrmanPeriodicCallback())
+        !testIomanReadOnlyFile() || !testTimrmanPeriodicCallback() ||
+        !testTimrmanHardwareInterruptRepeats())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;

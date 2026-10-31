@@ -97,6 +97,13 @@ namespace ps2x::iop
         virtual void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) = 0;
 
         virtual std::string hostPath(HostPathKind kind) const = 0;
+        // EE sceCdSearchFile can assign synthetic LSNs for loose disc files.
+        // Let IOP cdvdman read through that same map before its local ISO map.
+        virtual bool readCdSectors(uint32_t lsn, uint32_t sectors, void *destination, size_t size) const
+        {
+            (void)lsn; (void)sectors; (void)destination; (void)size;
+            return false;
+        }
         virtual std::string translateGuestPath(std::string_view path) const = 0;
         virtual uint64_t openHostFile(std::string_view path) = 0;
         virtual bool hostFileSize(uint64_t handle, uint64_t &size) const = 0;
