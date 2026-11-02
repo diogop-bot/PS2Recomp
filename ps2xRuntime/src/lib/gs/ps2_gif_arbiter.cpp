@@ -28,8 +28,12 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    if (!m_spare.empty())
+    {
+        pkt.data = std::move(m_spare.back());
+        m_spare.pop_back();
+    }
+    pkt.data.assign(data, data + sizeBytes);
     m_queue.push_back(std::move(pkt));
 }
 
@@ -62,6 +66,11 @@ void GifArbiter::drain()
             else
                 m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
+    }
+    for (auto &pkt : m_queue)
+    {
+        if (m_spare.size() < 32u && pkt.data.capacity() <= (1u << 20))
+            m_spare.push_back(std::move(pkt.data));
     }
     m_queue.clear();
 }

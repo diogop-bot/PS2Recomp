@@ -242,6 +242,56 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
     return basePage * 2048 + y * strideBytes + x * 4;
 }
 
+struct PS2Memory::GsWorker
+{
+    struct Item
+    {
+        std::vector<uint8_t> data;
+        std::function<void()> fn;
+        bool gif = false;
+    };
+    struct WaitStat
+    {
+        const char *reason = nullptr;
+        uint64_t waits = 0u;
+        uint64_t ns = 0u;
+    };
+
+    std::mutex mutex;
+    std::condition_variable workCv;
+    std::condition_variable idleCv;
+    std::deque<Item> queue;
+    bool busy = false;
+    bool stop = false;
+    std::thread thread;
+    // Guarded by mutex: time the worker spent working and the EE side spent waiting for it.
+    uint64_t busyNs = 0u;
+    std::array<WaitStat, 16> waits{};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    // Used transfer buffers, handed back by the worker so DMA kicks don't allocate each time.
+    std::mutex poolMutex;
+    std::vector<std::vector<uint8_t>> pool;
+};
+
+namespace
+{
+    std::vector<uint8_t> takePooledBuffer(std::mutex &mutex, std::vector<std::vector<uint8_t>> &pool)
+    {
+        std::lock_guard lock(mutex);
+        if (pool.empty())
+        {
+            std::vector<uint8_t> buffer;
+            buffer.reserve(64u * 1024u); // most packets fit, so building one rarely reallocates
+            return buffer;
+        }
+        std::vector<uint8_t> buffer = std::move(pool.back());
+        pool.pop_back();
+        buffer.clear();
+        return buffer;
+    }
+}
+
+
 PS2Memory::PS2Memory()
     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
 {
@@ -1368,7 +1418,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 4096;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = (m_gsWorker ? takePooledBuffer(m_gsWorker->poolMutex, m_gsWorker->pool) : std::vector<uint8_t>{});
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1683,34 +1733,6 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
-struct PS2Memory::GsWorker
-{
-    struct Item
-    {
-        std::vector<uint8_t> data;
-        std::function<void()> fn;
-        bool gif = false;
-    };
-    struct WaitStat
-    {
-        const char *reason = nullptr;
-        uint64_t waits = 0u;
-        uint64_t ns = 0u;
-    };
-
-    std::mutex mutex;
-    std::condition_variable workCv;
-    std::condition_variable idleCv;
-    std::deque<Item> queue;
-    bool busy = false;
-    bool stop = false;
-    std::thread thread;
-    // Guarded by mutex: time the worker spent working and the EE side spent waiting for it.
-    uint64_t busyNs = 0u;
-    std::array<WaitStat, 16> waits{};
-    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
-};
-
 void PS2Memory::setGsWorker(bool enabled)
 {
     if (enabled == (m_gsWorker != nullptr))
@@ -1763,6 +1785,12 @@ void PS2Memory::runGsWorker()
         catch (const std::exception &e)
         {
             std::cerr << "[gs_worker] " << e.what() << std::endl;
+        }
+        if (item.data.capacity() != 0u && item.data.capacity() <= (4u << 20))
+        {
+            std::lock_guard lock(w.poolMutex);
+            if (w.pool.size() < 64u)
+                w.pool.push_back(std::move(item.data));
         }
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
         std::lock_guard lock(w.mutex);
@@ -1841,7 +1869,11 @@ void PS2Memory::enqueueGsWork(std::vector<uint8_t> &&data, bool gif)
 void PS2Memory::gifTransfer(const uint8_t *data, uint32_t sizeBytes, bool async)
 {
     if (async)
-        enqueueGsWork(std::vector<uint8_t>(data, data + sizeBytes), true);
+    {
+        std::vector<uint8_t> buffer = (m_gsWorker ? takePooledBuffer(m_gsWorker->poolMutex, m_gsWorker->pool) : std::vector<uint8_t>{});
+        buffer.assign(data, data + sizeBytes);
+        enqueueGsWork(std::move(buffer), true);
+    }
     else
         submitGifPacket(GifPathId::Path3, data, sizeBytes, false);
 }
@@ -1857,7 +1889,11 @@ void PS2Memory::gifTransfer(std::vector<uint8_t> &&data, bool async)
 void PS2Memory::vif1Transfer(const uint8_t *data, uint32_t sizeBytes, bool async)
 {
     if (async)
-        enqueueGsWork(std::vector<uint8_t>(data, data + sizeBytes), false);
+    {
+        std::vector<uint8_t> buffer = (m_gsWorker ? takePooledBuffer(m_gsWorker->poolMutex, m_gsWorker->pool) : std::vector<uint8_t>{});
+        buffer.assign(data, data + sizeBytes);
+        enqueueGsWork(std::move(buffer), false);
+    }
     else
         processVIF1Data(data, sizeBytes);
 }

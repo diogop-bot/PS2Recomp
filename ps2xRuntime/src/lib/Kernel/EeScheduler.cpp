@@ -1296,7 +1296,9 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         return;
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
-    std::vector<EeIrqHandler> matching;
+    // Reused between interrupts (executor thread only) so dispatching doesn't allocate.
+    static thread_local std::vector<EeIrqHandler> matching;
+    matching.clear();
     for (const auto &[id, handler] : handlers)
     {
         (void)id;

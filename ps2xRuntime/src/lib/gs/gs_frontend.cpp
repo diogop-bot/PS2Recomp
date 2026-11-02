@@ -1573,7 +1573,7 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
-    if (drawing && m_backend)
+    if (drawing && m_backend && m_backend->WantsPrimitives())
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);

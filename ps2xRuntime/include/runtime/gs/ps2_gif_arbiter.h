@@ -43,6 +43,8 @@ private:
     ProcessPacketFn m_processFn;
     ProcessPathPacketFn m_processPathFn;
     std::vector<GifArbiterPacket> m_queue;
+    // Drained packet buffers, reused by submit() so a packet costs no heap allocation.
+    std::vector<std::vector<uint8_t>> m_spare;
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);
