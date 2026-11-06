@@ -28,9 +28,18 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    if (!m_spare.empty())
+    // Best fit among the spare buffers, so a big packet doesn't regrow a small one.
+    size_t pick = m_spare.size();
+    for (size_t i = 0; i < m_spare.size(); ++i)
     {
-        pkt.data = std::move(m_spare.back());
+        const size_t capacity = m_spare[i].capacity();
+        if (capacity >= sizeBytes && (pick == m_spare.size() || capacity < m_spare[pick].capacity()))
+            pick = i;
+    }
+    if (pick != m_spare.size())
+    {
+        pkt.data = std::move(m_spare[pick]);
+        m_spare[pick] = std::move(m_spare.back());
         m_spare.pop_back();
     }
     pkt.data.assign(data, data + sizeBytes);
@@ -42,8 +51,7 @@ void GifArbiter::drain()
     if (!m_processFn && !m_processPathFn)
         return;
 
-    std::stable_sort(m_queue.begin(), m_queue.end(),
-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+    const auto before = [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                      {
                          // DIRECTHL cannot preempt PATH3 IMAGE transfers.
                          if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
@@ -54,7 +62,11 @@ void GifArbiter::drain()
                                  return false;
                          }
                          return pathPriority(a.pathId) < pathPriority(b.pathId);
-                     });
+                     };
+    // stable_sort allocates a temporary buffer for more than a few dozen packets; they usually
+    // arrive in order already.
+    if (!std::is_sorted(m_queue.begin(), m_queue.end(), before))
+        std::stable_sort(m_queue.begin(), m_queue.end(), before);
 
     for (size_t i = 0; i < m_queue.size(); ++i)
     {
@@ -69,7 +81,7 @@ void GifArbiter::drain()
     }
     for (auto &pkt : m_queue)
     {
-        if (m_spare.size() < 32u && pkt.data.capacity() <= (1u << 20))
+        if (m_spare.size() < 32u && pkt.data.capacity() <= (8u << 20))
             m_spare.push_back(std::move(pkt.data));
     }
     m_queue.clear();

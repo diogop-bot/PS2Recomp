@@ -242,6 +242,82 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
     return basePage * 2048 + y * strideBytes + x * 4;
 }
 
+namespace
+{
+    // Transfer buffers handed back by the GS worker, so DMA kicks don't allocate each time. Kept in
+    // power-of-two capacity classes (64 KB .. 32 MB), at most 256 MB in all: a dense frame sends
+    // hundreds of transfers, and a buffer freed by the worker and allocated again by the EE thread
+    // costs both threads heap time.
+    class TransferBufferPool
+    {
+    public:
+        // A cleared buffer that holds at least `size` bytes (0: unknown, e.g. a DMA chain being built,
+        // which gets about the size of the last chain so it rarely regrows).
+        std::vector<uint8_t> take(size_t size)
+        {
+            std::lock_guard lock(m_mutex);
+            if (size == 0u)
+                size = m_chainHint;
+            for (size_t c = classOf(size); c < kClasses; ++c)
+            {
+                auto &bucket = m_buckets[c];
+                if (!bucket.empty())
+                {
+                    std::vector<uint8_t> buffer = std::move(bucket.back());
+                    bucket.pop_back();
+                    m_bytes -= buffer.capacity();
+                    buffer.clear();
+                    return buffer;
+                }
+            }
+            std::vector<uint8_t> buffer;
+            buffer.reserve(size_t{1} << (classOf(size) + kMinShift));
+            return buffer;
+        }
+
+        void give(std::vector<uint8_t> &&buffer)
+        {
+            const size_t capacity = buffer.capacity();
+            if (capacity < (size_t{1} << kMinShift) || capacity > (size_t{1} << (kMinShift + kClasses - 1)))
+                return;
+            std::lock_guard lock(m_mutex);
+            if (m_bytes + capacity > kMaxBytes)
+                return;
+            // A buffer goes in the largest class it fully covers, so take() can rely on the class.
+            size_t c = classOf(capacity);
+            if ((size_t{1} << (c + kMinShift)) > capacity)
+                --c;
+            m_bytes += capacity;
+            m_buckets[c].push_back(std::move(buffer));
+        }
+
+        void noteChainSize(size_t size)
+        {
+            std::lock_guard lock(m_mutex);
+            m_chainHint = size + size / 4u;
+        }
+
+    private:
+        static constexpr size_t kMinShift = 16; // 64 KB
+        static constexpr size_t kClasses = 10;  // .. 32 MB
+        static constexpr size_t kMaxBytes = size_t{256} << 20;
+
+        // The smallest class whose buffers hold `size` bytes.
+        static size_t classOf(size_t size)
+        {
+            size_t c = 0;
+            while (c + 1 < kClasses && (size_t{1} << (c + kMinShift)) < size)
+                ++c;
+            return c;
+        }
+
+        std::mutex m_mutex;
+        std::array<std::vector<std::vector<uint8_t>>, kClasses> m_buckets;
+        size_t m_bytes = 0u;
+        size_t m_chainHint = 0u;
+    };
+}
+
 struct PS2Memory::GsWorker
 {
     struct Item
@@ -268,29 +344,8 @@ struct PS2Memory::GsWorker
     uint64_t busyNs = 0u;
     std::array<WaitStat, 16> waits{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
-    // Used transfer buffers, handed back by the worker so DMA kicks don't allocate each time.
-    std::mutex poolMutex;
-    std::vector<std::vector<uint8_t>> pool;
+    TransferBufferPool pool;
 };
-
-namespace
-{
-    std::vector<uint8_t> takePooledBuffer(std::mutex &mutex, std::vector<std::vector<uint8_t>> &pool)
-    {
-        std::lock_guard lock(mutex);
-        if (pool.empty())
-        {
-            std::vector<uint8_t> buffer;
-            buffer.reserve(64u * 1024u); // most packets fit, so building one rarely reallocates
-            return buffer;
-        }
-        std::vector<uint8_t> buffer = std::move(pool.back());
-        pool.pop_back();
-        buffer.clear();
-        return buffer;
-    }
-}
-
 
 PS2Memory::PS2Memory()
     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
@@ -1418,7 +1473,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 4096;
-                    std::vector<uint8_t> chainBuf = (m_gsWorker ? takePooledBuffer(m_gsWorker->poolMutex, m_gsWorker->pool) : std::vector<uint8_t>{});
+                    std::vector<uint8_t> chainBuf = (m_gsWorker ? m_gsWorker->pool.take(0u) : std::vector<uint8_t>{});
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1601,6 +1656,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
 
+                    if (m_gsWorker)
+                        m_gsWorker->pool.noteChainSize(chainBuf.size());
                     if (!chainBuf.empty())
                     {
                         PendingTransfer pt;
@@ -1786,12 +1843,7 @@ void PS2Memory::runGsWorker()
         {
             std::cerr << "[gs_worker] " << e.what() << std::endl;
         }
-        if (item.data.capacity() != 0u && item.data.capacity() <= (4u << 20))
-        {
-            std::lock_guard lock(w.poolMutex);
-            if (w.pool.size() < 64u)
-                w.pool.push_back(std::move(item.data));
-        }
+        w.pool.give(std::move(item.data));
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
         std::lock_guard lock(w.mutex);
         w.busy = false;
@@ -1870,7 +1922,7 @@ void PS2Memory::gifTransfer(const uint8_t *data, uint32_t sizeBytes, bool async)
 {
     if (async)
     {
-        std::vector<uint8_t> buffer = (m_gsWorker ? takePooledBuffer(m_gsWorker->poolMutex, m_gsWorker->pool) : std::vector<uint8_t>{});
+        std::vector<uint8_t> buffer = (m_gsWorker ? m_gsWorker->pool.take(sizeBytes) : std::vector<uint8_t>{});
         buffer.assign(data, data + sizeBytes);
         enqueueGsWork(std::move(buffer), true);
     }
@@ -1890,7 +1942,7 @@ void PS2Memory::vif1Transfer(const uint8_t *data, uint32_t sizeBytes, bool async
 {
     if (async)
     {
-        std::vector<uint8_t> buffer = (m_gsWorker ? takePooledBuffer(m_gsWorker->poolMutex, m_gsWorker->pool) : std::vector<uint8_t>{});
+        std::vector<uint8_t> buffer = (m_gsWorker ? m_gsWorker->pool.take(sizeBytes) : std::vector<uint8_t>{});
         buffer.assign(data, data + sizeBytes);
         enqueueGsWork(std::move(buffer), false);
     }

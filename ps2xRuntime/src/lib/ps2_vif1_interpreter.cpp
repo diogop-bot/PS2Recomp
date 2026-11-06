@@ -312,9 +312,10 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
 namespace
 {
     // UNPACK in the formats the generic loop decodes: the same results as that loop, specialised
-    // per format. As there, components a format does not carry keep the VU memory's old value (and
-    // still get the row added in the offset/difference modes), a single component (S) is written to
-    // all four fields, and fill cycles (cl < wl) write the row where the mask selects data.
+    // per format, mode and masking, with SSE4.1. As there, components a format does not carry keep
+    // the VU memory's old value (and still get the row added in the offset/difference modes), a
+    // single component (S) is written to all four fields, and fill cycles (cl < wl) write the row
+    // where the mask selects data. Only the bytes of each vector are read from the source.
     static_assert(PS2_VU1_DATA_SIZE == 0x400u * 16u, "UNPACK addresses wrap at 0x3FF quadwords");
 
     template <uint32_t VN, uint32_t VL>
@@ -326,67 +327,174 @@ namespace
             return (VN + 1u) * (VL == 0u ? 4u : VL == 1u ? 2u : 1u);
     }
 
-    template <uint32_t VN, uint32_t VL>
-    inline void decodeUnpackVector(const uint8_t *src, bool zeroExtend, uint32_t *v)
+    // Unaligned little loads. MSVC calls memcpy for these at /O1, so read them directly there.
+    inline uint32_t unpackLoad16(const uint8_t *p)
     {
-        auto component = [&](uint32_t c) -> uint32_t
-        {
-            if constexpr (VL == 0u)
-            {
-                uint32_t raw;
-                std::memcpy(&raw, src + c * 4u, sizeof(raw));
-                return raw;
-            }
-            else if constexpr (VL == 1u)
-            {
-                uint16_t raw;
-                std::memcpy(&raw, src + c * 2u, sizeof(raw));
-                return zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
-            }
-            else
-            {
-                const uint8_t raw = src[c];
-                return zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
-            }
-        };
+#if defined(_MSC_VER)
+        return *reinterpret_cast<const __unaligned uint16_t *>(p);
+#else
+        uint16_t v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+#endif
+    }
+
+    inline uint32_t unpackLoad32(const uint8_t *p)
+    {
+#if defined(_MSC_VER)
+        return *reinterpret_cast<const __unaligned uint32_t *>(p);
+#else
+        uint32_t v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+#endif
+    }
+
+    // One source vector as four 32-bit fields. Fields the format does not carry come from old.
+    // ext is 0 for zero extension, or the component's sign bit in every lane for sign extension
+    // ((x ^ s) - s sign-extends a zero-extended x).
+    template <uint32_t VN, uint32_t VL>
+    inline __m128i decodeUnpackVector(const uint8_t *src, __m128i old, __m128i ext)
+    {
         if constexpr (VN == 3u && VL == 3u)
         {
-            uint16_t packed;
-            std::memcpy(&packed, src, sizeof(packed));
-            v[0] = packed & 0x1Fu;
-            v[1] = (packed >> 5) & 0x1Fu;
-            v[2] = (packed >> 10) & 0x1Fu;
-            v[3] = (packed >> 15) & 0x01u;
+            const uint32_t packed = unpackLoad16(src);
+            return _mm_setr_epi32(static_cast<int>(packed & 0x1Fu), static_cast<int>((packed >> 5) & 0x1Fu),
+                                  static_cast<int>((packed >> 10) & 0x1Fu), static_cast<int>((packed >> 15) & 0x01u));
         }
-        else if constexpr (VN == 0u)
+        else if constexpr (VL == 0u)
         {
-            v[0] = v[1] = v[2] = v[3] = component(0u);
+            if constexpr (VN == 3u)
+                return _mm_loadu_si128(reinterpret_cast<const __m128i *>(src));
+            else if constexpr (VN == 2u)
+            {
+                const __m128i xy = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(src));
+                return _mm_blend_epi16(old, _mm_insert_epi32(xy, static_cast<int>(unpackLoad32(src + 8u)), 2), 0x3F);
+            }
+            else if constexpr (VN == 1u)
+                return _mm_blend_epi16(old, _mm_loadl_epi64(reinterpret_cast<const __m128i *>(src)), 0x0F);
+            else
+                return _mm_shuffle_epi32(_mm_cvtsi32_si128(static_cast<int>(unpackLoad32(src))), 0x00);
         }
         else
         {
-            for (uint32_t c = 0; c <= VN; ++c)
-                v[c] = component(c);
+            __m128i v;
+            if constexpr (VL == 1u)
+            {
+                if constexpr (VN == 3u)
+                    v = _mm_cvtepu16_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(src)));
+                else if constexpr (VN == 2u)
+                    v = _mm_cvtepu16_epi32(_mm_insert_epi16(_mm_cvtsi32_si128(static_cast<int>(unpackLoad32(src))),
+                                                            static_cast<int>(unpackLoad16(src + 4u)), 2));
+                else if constexpr (VN == 1u)
+                    v = _mm_cvtepu16_epi32(_mm_cvtsi32_si128(static_cast<int>(unpackLoad32(src))));
+                else
+                    v = _mm_shuffle_epi32(_mm_cvtsi32_si128(static_cast<int>(unpackLoad16(src))), 0x00);
+            }
+            else
+            {
+                if constexpr (VN == 3u)
+                    v = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(static_cast<int>(unpackLoad32(src))));
+                else if constexpr (VN == 2u)
+                    v = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(static_cast<int>(unpackLoad16(src) | (static_cast<uint32_t>(src[2]) << 16))));
+                else if constexpr (VN == 1u)
+                    v = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(static_cast<int>(unpackLoad16(src))));
+                else
+                    v = _mm_shuffle_epi32(_mm_cvtsi32_si128(static_cast<int>(src[0])), 0x00);
+            }
+            v = _mm_sub_epi32(_mm_xor_si128(v, ext), ext);
+            if constexpr (VN == 2u)
+                return _mm_blend_epi16(old, v, 0x3F);
+            else if constexpr (VN == 1u)
+                return _mm_blend_epi16(old, v, 0x0F);
+            else
+                return v;
         }
     }
 
-    template <uint32_t VN, uint32_t VL>
-    void unpackFast(uint8_t *vuData, const uint8_t *src, uint32_t count, uint32_t vuAddr, uint32_t cl, uint32_t wl,
-                    bool zeroExtend, uint32_t mode, uint32_t mask, uint32_t *row, const uint32_t *col)
+    // The mask register as lane masks per cycle position (positions past 3 use row 3).
+    struct UnpackMasks
+    {
+        __m128i data[4];    // fields written with the data
+        __m128i rowSel[4];  // fields written with the row
+        __m128i fill[4];    // fields a fill cycle writes with the row (data or row)
+        __m128i protect[4]; // fields left as they are
+        __m128i colPart[4]; // the column value in the fields written with it, 0 elsewhere
+    };
+
+    inline void buildUnpackMasks(uint32_t mask, const uint32_t *col, UnpackMasks &mk)
+    {
+        // Byte 4m+f holds the mask byte of cycle m; keep only field f's two bits, in place.
+        const __m128i spread = _mm_shuffle_epi8(_mm_cvtsi32_si128(static_cast<int>(mask)),
+                                                _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3));
+        const __m128i fieldBits = _mm_set1_epi32(static_cast<int>(0xC0300C03u));
+        const __m128i bits = _mm_and_si128(spread, fieldBits);
+        const __m128i isData = _mm_cmpeq_epi8(bits, _mm_setzero_si128());
+        const __m128i isRow = _mm_cmpeq_epi8(bits, _mm_set1_epi32(0x40100401));
+        const __m128i isCol = _mm_cmpeq_epi8(bits, _mm_set1_epi32(static_cast<int>(0x80200802u)));
+        const __m128i isProtect = _mm_cmpeq_epi8(bits, fieldBits);
+        const __m128i colv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(col));
+        auto widen = [](__m128i bytes, __m128i *out)
+        {
+            out[0] = _mm_cvtepi8_epi32(bytes);
+            out[1] = _mm_cvtepi8_epi32(_mm_srli_si128(bytes, 4));
+            out[2] = _mm_cvtepi8_epi32(_mm_srli_si128(bytes, 8));
+            out[3] = _mm_cvtepi8_epi32(_mm_srli_si128(bytes, 12));
+        };
+        widen(isData, mk.data);
+        widen(isRow, mk.rowSel);
+        widen(_mm_or_si128(isData, isRow), mk.fill);
+        widen(isProtect, mk.protect);
+        __m128i colSel[4];
+        widen(isCol, colSel);
+        mk.colPart[0] = _mm_and_si128(colSel[0], _mm_shuffle_epi32(colv, 0x00));
+        mk.colPart[1] = _mm_and_si128(colSel[1], _mm_shuffle_epi32(colv, 0x55));
+        mk.colPart[2] = _mm_and_si128(colSel[2], _mm_shuffle_epi32(colv, 0xAA));
+        mk.colPart[3] = _mm_and_si128(colSel[3], _mm_shuffle_epi32(colv, 0xFF));
+    }
+
+    // Games set the mask and column once for many UNPACKs: keep the last lane masks per thread.
+    struct UnpackMaskCache
+    {
+        UnpackMasks masks;
+        __m128i col;
+        uint32_t mask;
+        bool valid;
+    };
+    thread_local UnpackMaskCache t_unpackMaskCache;
+
+    inline const UnpackMasks &cachedUnpackMasks(uint32_t mask, const uint32_t *col)
+    {
+        UnpackMaskCache &cache = t_unpackMaskCache;
+        const __m128i colv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(col));
+        if (!cache.valid || cache.mask != mask || _mm_movemask_epi8(_mm_cmpeq_epi32(cache.col, colv)) != 0xFFFF)
+        {
+            buildUnpackMasks(mask, col, cache.masks);
+            cache.col = colv;
+            cache.mask = mask;
+            cache.valid = true;
+        }
+        return cache.masks;
+    }
+
+    // MODE: 0 = plain (also mode 3), 1 = offset, 2 = difference. MASKED with mk, else every field data.
+    template <uint32_t VN, uint32_t VL, uint32_t MODE, bool MASKED>
+    void unpackLoop(uint8_t *vuData, const uint8_t *src, uint32_t count, uint32_t vuAddr, uint32_t cl, uint32_t wl, __m128i ext,
+                    const UnpackMasks *mk, uint32_t *rowReg)
     {
         constexpr uint32_t bytes = unpackVectorBytes<VN, VL>();
-        constexpr bool canAdd = !(VN == 3u && VL == 3u);
-        const bool add = canAdd && (mode == 1u || mode == 2u);
-        // Write selection per cycle position (positions past 3 use row 3 of the mask) and field:
-        // 0 = data, 1 = row, 2 = column, 3 = write-protect.
-        uint32_t spec[4][4];
-        bool allData[4];
-        for (uint32_t c = 0; c < 4u; ++c)
+        constexpr bool needOld = MASKED || VN == 1u || VN == 2u;
+        __m128i row = _mm_loadu_si128(reinterpret_cast<const __m128i *>(rowReg));
+        // Without the difference mode the row is constant: the row/column part of each cycle
+        // position's result is too.
+        __m128i fixedPart[4];
+        __m128i fillPart[4];
+        if constexpr (MASKED && MODE != 2u)
         {
-            allData[c] = true;
-            for (uint32_t f = 0; f < 4u; ++f)
+            for (uint32_t m = 0; m < 4u; ++m)
             {
-                spec[c][f] = (mask >> ((c * 4u + f) * 2u)) & 3u;
-                allData[c] = allData[c] && spec[c][f] == 0u;
+                fixedPart[m] = _mm_or_si128(_mm_and_si128(row, mk->rowSel[m]), mk->colPart[m]);
+                fillPart[m] = _mm_or_si128(_mm_and_si128(row, mk->fill[m]), mk->colPart[m]);
             }
         }
         const bool filling = cl < wl;
@@ -395,53 +503,94 @@ namespace
         for (uint32_t i = 0; i < count; ++i)
         {
             const uint32_t destVec = filling ? vuAddr + i : vuAddr + block + cycle;
-            uint8_t *dest = vuData + (destVec & 0x3FFu) * 16u;
-            const bool hasSource = !filling || cycle < cl;
+            __m128i *dest = reinterpret_cast<__m128i *>(vuData + (destVec & 0x3FFu) * 16u);
+            const __m128i old = needOld ? _mm_loadu_si128(dest) : _mm_setzero_si128();
             const uint32_t m = cycle > 3u ? 3u : cycle;
-            uint32_t v[4];
-            std::memcpy(v, dest, sizeof(v));
-            if (hasSource && allData[m])
+            __m128i result;
+            if (!filling || cycle < cl)
             {
-                decodeUnpackVector<VN, VL>(src, zeroExtend, v);
-                if (add)
+                __m128i d = decodeUnpackVector<VN, VL>(src, old, ext);
+                src += bytes;
+                if constexpr (MODE != 0u)
+                    d = _mm_add_epi32(d, row);
+                if constexpr (!MASKED)
                 {
-                    for (uint32_t f = 0; f < 4u; ++f)
+                    if constexpr (MODE == 2u)
+                        row = d;
+                    result = d;
+                }
+                else
+                {
+                    result = _mm_or_si128(_mm_and_si128(d, mk->data[m]), _mm_and_si128(old, mk->protect[m]));
+                    if constexpr (MODE == 2u)
                     {
-                        v[f] += row[f];
-                        if (mode == 2u)
-                            row[f] = v[f];
+                        row = _mm_blendv_epi8(row, d, mk->data[m]);
+                        result = _mm_or_si128(result, _mm_or_si128(_mm_and_si128(row, mk->rowSel[m]), mk->colPart[m]));
                     }
+                    else
+                        result = _mm_or_si128(result, fixedPart[m]);
                 }
             }
             else
             {
-                uint32_t d[4] = {v[0], v[1], v[2], v[3]};
-                if (hasSource)
-                    decodeUnpackVector<VN, VL>(src, zeroExtend, d);
-                for (uint32_t f = 0; f < 4u; ++f)
-                {
-                    uint32_t sel = spec[m][f];
-                    if (!hasSource && sel == 0u)
-                        sel = 1u; // fill cycles write the row where the data would go
-                    if (sel == 0u)
-                    {
-                        v[f] = add ? d[f] + row[f] : d[f];
-                        if (add && mode == 2u)
-                            row[f] = v[f];
-                    }
-                    else if (sel == 1u)
-                        v[f] = row[f];
-                    else if (sel == 2u)
-                        v[f] = col[m];
-                }
+                // Fill cycle: the row where the data would go; no add, no row update.
+                if constexpr (!MASKED)
+                    result = row;
+                else if constexpr (MODE == 2u)
+                    result = _mm_or_si128(_mm_or_si128(_mm_and_si128(row, mk->fill[m]), mk->colPart[m]),
+                                          _mm_and_si128(old, mk->protect[m]));
+                else
+                    result = _mm_or_si128(fillPart[m], _mm_and_si128(old, mk->protect[m]));
             }
-            std::memcpy(dest, v, sizeof(v));
-            if (hasSource)
-                src += bytes;
+            _mm_storeu_si128(dest, result);
             if (++cycle == wl)
             {
                 cycle = 0u;
                 block += cl;
+            }
+        }
+        if constexpr (MODE == 2u)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(rowReg), row);
+    }
+
+    template <uint32_t VN, uint32_t VL>
+    void unpackFast(uint8_t *vuData, const uint8_t *src, uint32_t count, uint32_t vuAddr, uint32_t cl, uint32_t wl,
+                    bool zeroExtend, uint32_t mode, uint32_t mask, uint32_t *row, const uint32_t *col)
+    {
+        const __m128i ext = (VL == 0u || VL == 3u || zeroExtend) ? _mm_setzero_si128()
+                                                                  : _mm_set1_epi32(VL == 1u ? 0x8000 : 0x80);
+        const bool masked = mask != 0u; // an all-data mask is the same as no mask
+        const UnpackMasks *mk = masked ? &cachedUnpackMasks(mask, col) : nullptr;
+        if constexpr (VN == 3u && VL == 3u)
+        {
+            // V4-5 is never added to the row.
+            if (masked)
+                unpackLoop<VN, VL, 0u, true>(vuData, src, count, vuAddr, cl, wl, ext, mk, row);
+            else
+                unpackLoop<VN, VL, 0u, false>(vuData, src, count, vuAddr, cl, wl, ext, nullptr, row);
+        }
+        else
+        {
+            switch ((mode == 3u ? 0u : mode) * 2u + (masked ? 1u : 0u))
+            {
+            case 0:
+                unpackLoop<VN, VL, 0u, false>(vuData, src, count, vuAddr, cl, wl, ext, nullptr, row);
+                break;
+            case 1:
+                unpackLoop<VN, VL, 0u, true>(vuData, src, count, vuAddr, cl, wl, ext, mk, row);
+                break;
+            case 2:
+                unpackLoop<VN, VL, 1u, false>(vuData, src, count, vuAddr, cl, wl, ext, nullptr, row);
+                break;
+            case 3:
+                unpackLoop<VN, VL, 1u, true>(vuData, src, count, vuAddr, cl, wl, ext, mk, row);
+                break;
+            case 4:
+                unpackLoop<VN, VL, 2u, false>(vuData, src, count, vuAddr, cl, wl, ext, nullptr, row);
+                break;
+            default:
+                unpackLoop<VN, VL, 2u, true>(vuData, src, count, vuAddr, cl, wl, ext, mk, row);
+                break;
             }
         }
     }
@@ -455,6 +604,14 @@ namespace
         unpackFast<1, 0>, unpackFast<1, 1>, unpackFast<1, 2>, nullptr,
         unpackFast<2, 0>, unpackFast<2, 1>, unpackFast<2, 2>, nullptr,
         unpackFast<3, 0>, unpackFast<3, 1>, unpackFast<3, 2>, unpackFast<3, 3>,
+    };
+
+    // Source bytes per vector, by vn * 4 + vl (for the formats in kUnpackFast).
+    constexpr uint8_t kUnpackVectorBytes[16] = {
+        4u, 2u, 1u, 0u,
+        8u, 4u, 2u, 0u,
+        12u, 6u, 3u, 0u,
+        16u, 8u, 4u, 2u,
     };
 }
 
@@ -558,6 +715,43 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         vif1_regs.num = num;
         if (irq)
             vif1_regs.stat |= (1u << 11); // INT
+
+        // UNPACK, the most frequent command, first: the specialised loops. Formats they do not
+        // handle (and every UNPACK with s_vif1FastUnpack off) go to the generic loop further down.
+        if ((opcode & 0x60u) == 0x60u && s_vif1FastUnpack)
+        {
+            const uint32_t format = opcode & 0xFu;
+            const UnpackFastFn fastUnpack = kUnpackFast[format];
+            if (fastUnpack)
+            {
+                const uint32_t writeVectorCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+                uint32_t cl = vif1_regs.cycle & 0xFFu;
+                uint32_t wl = (vif1_regs.cycle >> 8) & 0xFFu;
+                if (cl == 0u)
+                    cl = 1u;
+                if (wl == 0u)
+                    wl = 1u;
+                uint32_t sourceVectorCount = writeVectorCount;
+                if (cl < wl)
+                {
+                    const uint32_t remainder = writeVectorCount % wl;
+                    sourceVectorCount = (writeVectorCount / wl) * cl + (remainder > cl ? cl : remainder);
+                }
+                const uint32_t totalBytes = (sourceVectorCount * kUnpackVectorBytes[format] + 3u) & ~3u;
+                if (m_vu1Data && pos + totalBytes <= sizeBytes)
+                {
+                    uint32_t vuAddr = static_cast<uint32_t>(imm) & 0x3FFu;
+                    if ((imm & 0x8000u) != 0u)
+                        vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
+                    fastUnpack(m_vu1Data, data + pos, writeVectorCount, vuAddr, cl, wl, (imm & 0x4000u) != 0u,
+                               vif1_regs.mode & 3u, (opcode & 0x10u) != 0u ? vif1_regs.mask : 0u, vif1_regs.row, vif1_regs.col);
+                }
+                pos += totalBytes;
+                if (pos > sizeBytes)
+                    break;
+                continue;
+            }
+        }
 
         if (opcode == VIF_NOP)
         {
@@ -774,13 +968,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            const UnpackFastFn fastUnpack = s_vif1FastUnpack ? kUnpackFast[vn * 4u + vl] : nullptr;
-            if (fastUnpack && m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
-            {
-                fastUnpack(m_vu1Data, data + pos, writeVectorCount, vuAddr, cl, wl, zeroExtend, vif1_regs.mode & 3u,
-                           maskEnable ? vif1_regs.mask : 0u, vif1_regs.row, vif1_regs.col);
-            }
-            else if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
