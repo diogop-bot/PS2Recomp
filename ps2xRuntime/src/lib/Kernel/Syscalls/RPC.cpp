@@ -2,6 +2,10 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
+
 namespace ps2_syscalls
 {
     namespace
@@ -24,17 +28,30 @@ namespace ps2_syscalls
 
         void pushSifRpcDebugEvent(SifRpcDebugEvent event)
         {
-            if (std::getenv("MC_AUDIO_TRACE") && event.op &&
+            if (std::getenv("PS2X_AUDIO_TRACE") && event.op &&
                 (std::strcmp(event.op, "CallRpc") == 0 || std::strcmp(event.op, "BindRpc") == 0))
             {
                 static std::unordered_set<uint64_t> shown;
                 const uint64_t signature = (static_cast<uint64_t>(event.sid) << 32u) |
                     (std::strcmp(event.op, "CallRpc") == 0 ? event.rpcNum : 0xffffffffu);
                 if (shown.size() < 96u && shown.insert(signature).second)
-                    std::cerr << "[mc_sound:rpc] " << event.op << " sid=0x" << std::hex << event.sid
+                {
+                    // First 16 bytes of each buffer (read at completion, so a shared send/receive
+                    // buffer shows the reply in both).
+                    const auto hex16 = [](const uint8_t *bytes, uint32_t size)
+                    {
+                        std::ostringstream text;
+                        for (uint32_t i = 0; i < std::min<uint32_t>(size, 16u); ++i)
+                            text << std::hex << std::setw(2) << std::setfill('0') << unsigned(bytes[i]);
+                        return text.str();
+                    };
+                    std::cerr << "[audio-trace:rpc] " << event.op << " sid=0x" << std::hex << event.sid
                               << " fn=0x" << event.rpcNum << " send=0x" << event.sendSize
                               << " recv=0x" << event.recvSize << " flags=0x" << event.flags
-                              << std::dec << " result=" << event.result << '\n';
+                              << " end=0x" << event.endFunc << std::dec << " result=" << event.result
+                              << " sendbuf=" << hex16(event.sendPreview, event.sendPreviewSize)
+                              << " recvbuf=" << hex16(event.recvPreview, event.recvPreviewSize) << '\n';
+                }
             }
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
             pushSifRpcDebugEventLocked(event);
@@ -514,7 +531,7 @@ namespace ps2_syscalls
         }
 
         const uint32_t serverPtr = client->server;
-        if (sid == 0x12346u && std::getenv("MC_AUDIO_TRACE"))
+        if (sid == 0x12346u && std::getenv("PS2X_AUDIO_TRACE"))
         {
             static std::unordered_map<uint32_t, unsigned> samples;
             unsigned &count = samples[rpcNum];
@@ -523,7 +540,7 @@ namespace ps2_syscalls
                 const auto *payload = reinterpret_cast<const uint32_t *>(getMemPtr(rdram, sendBuf));
                 if (payload)
                 {
-                    std::cerr << "[mc_sound:audio-rpc] fn=0x" << std::hex << rpcNum
+                    std::cerr << "[audio-trace:audio-rpc] fn=0x" << std::hex << rpcNum
                               << " arg0=0x" << payload[0]
                               << " arg1=0x" << (sendSize >= 8u ? payload[1] : 0u)
                               << " arg2=0x" << (sendSize >= 12u ? payload[2] : 0u)
@@ -638,7 +655,7 @@ namespace ps2_syscalls
                 }
             }
 
-            if (sid == 0x12346u && std::getenv("MC_AUDIO_TRACE") &&
+            if (sid == 0x12346u && std::getenv("PS2X_AUDIO_TRACE") &&
                 (rpcNum == 0x8210u || rpcNum == 0x8280u || rpcNum == 0x8030u ||
                  rpcNum == 0x8060u || rpcNum == 0x8270u || rpcNum == 0x80b0u ||
                  rpcNum == 0x8000u))
@@ -649,7 +666,7 @@ namespace ps2_syscalls
                 {
                     const auto *reply = reinterpret_cast<const uint32_t *>(getMemPtr(rdram, receiveBuffer));
                     if (reply)
-                        std::cerr << "[mc_sound:audio-reply] fn=0x" << std::hex << rpcNum
+                        std::cerr << "[audio-trace:audio-reply] fn=0x" << std::hex << rpcNum
                                   << " out0=0x" << reply[0]
                                   << " out1=0x" << (receiveSize >= 8u ? reply[1] : 0u)
                                   << " out2=0x" << (receiveSize >= 12u ? reply[2] : 0u)

@@ -180,8 +180,8 @@ namespace ps2x::iop::detail
                 timer.source = a0;
                 timer.prescale = std::max(a2, 1u);
                 timer.counterBaseCycle = currentCycle;
-                if (std::getenv("MC_AUDIO_TRACE") && a0 == 4u)
-                    std::fprintf(stderr, "[mc_sound:timer] alloc source=%u width=%u irq=%u id=0x%x\n",
+                if (std::getenv("PS2X_AUDIO_TRACE") && a0 == 4u)
+                    std::fprintf(stderr, "[audio-trace:timer] alloc source=%u width=%u irq=%u id=0x%x\n",
                                  a0, a1, timer.irq, timerId(index));
                 setV0(timerId(index));
                 return true;
@@ -242,8 +242,8 @@ namespace ps2x::iop::detail
                 timer->running = true;
                 timer->counterBaseCycle = currentCycle;
                 schedule(*timer, currentCycle);
-                if (std::getenv("MC_AUDIO_TRACE") && timer->source == 4u)
-                    std::fprintf(stderr, "[mc_sound:timer] start irq=%u mode=0x%x compare=%u next=%llu\n",
+                if (std::getenv("PS2X_AUDIO_TRACE") && timer->source == 4u)
+                    std::fprintf(stderr, "[audio-trace:timer] start irq=%u mode=0x%x compare=%u next=%llu\n",
                                  timer->irq, a1, timer->compare,
                                  static_cast<unsigned long long>(timer->compareCycle));
             }
@@ -465,8 +465,8 @@ namespace ps2x::iop::detail
                 // A hardware timer can use intrman instead of SetTimerHandler.
                 // Its IRQ return value does not control whether the timer repeats.
                 const bool delivered = intrman->dispatchInterrupt(timer.irq, executor);
-                if (std::getenv("MC_AUDIO_TRACE") && timer.source == 4u && timer.handlerCalls <= 6u)
-                    std::fprintf(stderr, "[mc_sound:timer] due irq=%u delivered=%u cycle=%llu\n",
+                if (std::getenv("PS2X_AUDIO_TRACE") && timer.source == 4u && timer.handlerCalls <= 6u)
+                    std::fprintf(stderr, "[audio-trace:timer] due irq=%u delivered=%u cycle=%llu\n",
                                  timer.irq, delivered,
                                  static_cast<unsigned long long>(currentCycle));
                 result = compareDue ? timer.compare : 1u;

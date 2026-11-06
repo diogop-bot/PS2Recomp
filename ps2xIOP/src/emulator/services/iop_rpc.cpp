@@ -221,8 +221,8 @@ namespace ps2x::iop::detail
             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
             server.queue = m_memory.read32(stackPointer + 24u);
             m_servers[server.sid] = server;
-            if (std::getenv("MC_AUDIO_TRACE"))
-                m_host.log(LogLevel::Info, "[mc_sound:iop-rpc] register sid=" +
+            if (std::getenv("PS2X_AUDIO_TRACE"))
+                m_host.log(LogLevel::Info, "[audio-trace:iop-rpc] register sid=" +
                     std::to_string(server.sid) + " function=" + std::to_string(server.function) +
                     " buffer=" + std::to_string(server.buffer));
             if (server.serverData != 0u)

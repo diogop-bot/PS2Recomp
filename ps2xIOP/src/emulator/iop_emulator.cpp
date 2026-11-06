@@ -170,6 +170,10 @@ namespace ps2x::iop::detail
         void reset()
         {
             memory.reset();
+            // The stacks given to calls into module code are guest memory too: modules pass
+            // local arrays from them as read() buffers (This Is Football's PACKFS reads its pack
+            // index into one), and I/O into memory the guest never wrote was refused with EFAULT.
+            (void)memory.zeroRam(kCallStackBase, kCallStackLimit - kCallStackBase);
             kernel.reset();
             modules.clear();
             imports.reset();
@@ -447,8 +451,26 @@ namespace ps2x::iop::detail
             }
             if (iequals(call.library, "heaplib") && heaplib.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
+            // USB with nothing plugged in. The real USBD.IRX finds no OHCI controller and returns
+            // NO_RESIDENT_END, but its export table stays registered, so class drivers (This Is
+            // Football's LGKBM keyboard/mouse driver) called into an uninitialised USBD, got an
+            // error from sceUsbdRegisterLdd and failed their start-up, which the game treats as
+            // fatal. On a console with no USB device, registering succeeds and no connect callback
+            // ever comes.
+            if (iequals(call.library, "usbd"))
+            {
+                switch (call.ordinal)
+                {
+                case 4: // sceUsbdRegisterLdd
+                case 5: // sceUsbdUnregisterLdd
+                    setV0(0); // USB_RC_OK
+                    return ImportDisposition::Handled;
+                default:
+                    break; // no device, so nothing else should be reached: log it below
+                }
+            }
 
-            const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
+            const uint32_t target = iequals(call.library, "usbd") ? 0u : imports.resolve(call.library, call.ordinal, call.version);
             if (target != 0u)
             {
                 cpu.pc = target;
@@ -572,13 +594,13 @@ namespace ps2x::iop::detail
             }
             cpu.gpr[31] = kCallReturnSentinel;
             const uint32_t executed = runCpu(cpu, budget);
-            if (std::getenv("MC_AUDIO_TRACE") && cpu.pc != kCallReturnSentinel)
+            if (std::getenv("PS2X_AUDIO_TRACE") && cpu.pc != kCallReturnSentinel)
             {
                 static uint32_t incompleteCalls = 0;
                 if (incompleteCalls++ < 24)
                 {
                     std::ostringstream out;
-                    out << "[mc_sound:iop-call] incomplete function=0x" << std::hex << address
+                    out << "[audio-trace:iop-call] incomplete function=0x" << std::hex << address
                         << " pc=0x" << cpu.pc << " code=";
                     for (int offset = -12; offset <= 12; offset += 4)
                         out << ' ' << memory.read32(cpu.pc + offset);

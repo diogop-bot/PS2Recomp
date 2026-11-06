@@ -661,8 +661,8 @@ namespace ps2x::iop::detail
             const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
             if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
             {
-                if (std::getenv("MC_AUDIO_TRACE"))
-                    host.log(LogLevel::Warning, "[mc_sound:cdread] rejected lsn=" +
+                if (std::getenv("PS2X_AUDIO_TRACE"))
+                    host.log(LogLevel::Warning, "[audio-trace:cdread] rejected lsn=" +
                         std::to_string(lsn) + " sectors=" + std::to_string(sectors) +
                         " destination=" + std::to_string(destination) +
                         " bytes=" + std::to_string(byteCount64));
@@ -705,8 +705,8 @@ namespace ps2x::iop::detail
 
             if (!read || !memory.writeRam(destination, bytes.data(), bytes.size()))
             {
-                if (std::getenv("MC_AUDIO_TRACE"))
-                    host.log(LogLevel::Warning, "[mc_sound:cdread] data unavailable lsn=" +
+                if (std::getenv("PS2X_AUDIO_TRACE"))
+                    host.log(LogLevel::Warning, "[audio-trace:cdread] data unavailable lsn=" +
                         std::to_string(lsn) + " sectors=" + std::to_string(sectors) +
                         " image=" + imagePath);
                 lastError = kCdvdErrorRead;
