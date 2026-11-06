@@ -15,6 +15,8 @@ This project statically recompiles PS2 ELF binaries into C++ and provides a runt
 >   newer commit when it is ready, so one port's work can't break another's build.
 > - Switches and log tags use neutral names (`PS2X_...`), not a game's.
 > - Read [docs/PS2_PORT_PLAYBOOK.md](docs/PS2_PORT_PLAYBOOK.md) before starting a port.
+> - Tools for any port (drive and profile the game, read its RAM, decompile, VU1 ahead-of-time
+>   recompilation) are in [tools/ports](tools/ports/README.md); a port describes itself in a `ps2port.json`.
 
 ### Modules
 

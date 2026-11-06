@@ -5,7 +5,8 @@ can skip the research. Midnight Club details are kept as examples; the rest appl
 Paths such as `tools/...`, `src/...` and `analysis/...` are in the Midnight Club port's repository
 (github.com/diogop-bot/midnight-club-recomp), the reference port for this branch; its full
 day-by-day record is in `analysis/PHASE1.md`, `PHASE2.md` and `PHASE3.md`. Add lessons from
-other ports here, in the section they belong to.
+other ports here, in the section they belong to. The tools that work for any game are in this
+fork's `tools/ports/` (section 2); paths written `tools/ports/...` are there.
 
 Result for this game: boots, plays races in both cities with physics matching PCSX2, renders
 through PCSX2's GS at 4x, plays sound through PCSX2's SPU2, saves to a memory-card folder, and
@@ -35,6 +36,18 @@ Measure at every step (section 9). Most "obvious" causes were wrong.
 
 ## 2. Tooling and environment
 
+- **Shared port tools: `tools/ports/` in this fork** ([README](../tools/ports/README.md)):
+  `game_ctl.ps1` (start the game, press keys, screenshots, stop), `sample_profile.py`,
+  `guest_mem.py`, `decompile.ps1`, and the VU1 recompiler with its bench. Set them up on day one:
+  1. put a `ps2port.json` at the root of the port's repository with at least `exe` and `elf`
+     (paths relative to that file; `{config}` in `exe` is the build configuration), plus
+     `ghidra.project` once there is a Ghidra project and `vu1` once the VU1 program is recompiled.
+     The README lists every key; Midnight Club's file is a complete example;
+  2. run the tools from inside the repository (they find the nearest `ps2port.json`), or pass
+     `-Port` / `--port`, or set `PS2PORT_CONFIG`;
+  3. optionally keep short wrappers in the port's own `tools/` that pin its config and add its
+     own switches (Midnight Club's `tools/game_ctl.ps1` adds `-GsDump`).
+  Improve the tools there, not in a copy; keep game names out of them.
 - **Ghidra + Emotion Engine: Reloaded** (language `r5900:LE:32:default`). Stock Ghidra treats the
   EE as generic MIPS64 and gets MMI/COP2 wrong. Drive it headless (`analyzeHeadless.bat` + scripts in
   `ghidra_scripts/`). Script arguments with `|` or `,` get mangled by the `.bat`.
@@ -203,8 +216,9 @@ Architecture (`src/gs/`, `src/mc_gs_bridge.cpp`):
 
 ## 8. VU1: ahead-of-time recompilation
 
-- `tools/vu1_recompile.py` turns the microprogram image into C++ (`generated/vu1/`, game-derived,
-  untracked); `src/mc_vu1_gen.h` + `src/mc_vu1_fast.cpp` are the runtime side.
+- `tools/ports/vu1/vu1_recompile.py` turns the microprogram image into C++ (`generated/vu1/`,
+  game-derived, untracked) against the model in `tools/ports/vu1/ps2x_vu1_gen.h`; the port adds the
+  dispatch and XGKICK glue (Midnight Club: `src/mc_vu1_fast.cpp`).
 - **Reproduce the interpreter's cycle model exactly**, because values depend on it: per-lane stall
   scoreboard, Q latency (DIV 7, RSQRT 13), delayed MAC/clip flags (4 cycles), XGKICK busy time,
   the integer-branch "old VI" quirk, intra-pair write precedence, a branch in a delay slot.
@@ -229,7 +243,7 @@ Architecture (`src/gs/`, `src/mc_gs_bridge.cpp`):
   6. Skip operand normalization (Inf/NaN → ±max) for registers known to hold FMAC results: under
      round-to-zero + FTZ with normalized operands those are always finite. Loops normalize the
      registers they never write once on entry.
-- **Differential harness for generator changes** (`tools/vu1_bench`): capture real run inputs
+- **Differential harness for generator changes** (`tools/ports/vu1/bench`): capture real run inputs
   from the game (`MC_VU1_CAPTURE`), link the old and new generated programs into one exe in
   different namespaces (`/Dvu1gen=vu1old`), and compare everything including the cycle count,
   then time both. Faster and more repeatable than in-game verify; still run verify afterwards.
@@ -239,7 +253,7 @@ Architecture (`src/gs/`, `src/mc_gs_bridge.cpp`):
 ## 9. Performance: how to find and fix it
 
 ### Measuring
-- `tools/sample_profile.py --pid N` samples a running game per thread with PDB symbols.
+- `tools/ports/sample_profile.py --pid N` samples a running game per thread with PDB symbols.
   `--stacks REGEX` lists return-address chains (who waits where); `--lines REGEX` counts samples
   per source line (classify them by statement type to find the real cost).
 - `MC_FRAME_STATS=file`: one line per second with fps, average/worst frame time, frames over one
@@ -286,15 +300,15 @@ Architecture (`src/gs/`, `src/mc_gs_bridge.cpp`):
 - **Read runtime values, not the ELF's initial data** (log guest RAM from an override). Getting this
   wrong cost a day: the frame timer's fixed step is 1/60 in the ELF but 0 during races.
 - **Page-protection watchpoints** (`src/mc_watch.cpp`, `MC_WATCH=addr:bytes`) give the guest PC of
-  each store; then decompile that function (`tools/decompile.ps1`). Compare the watched bytes
+  each store; then decompile that function (`tools/ports/decompile.ps1`). Compare the watched bytes
   before and after each faulting store: checking only the fault address misses 128-bit stores and
   copies that start below the range (that hid a corruption for a whole session).
 - **A frozen game that still draws** (black screen, sound stops): sample it with
-  `tools/sample_profile.py --pid N`. A game thread sitting in one tiny `entry_XXXXXXXX` is a guest
+  `tools/ports/sample_profile.py --pid N`. A game thread sitting in one tiny `entry_XXXXXXXX` is a guest
   `b .` loop, usually the game's own fatal-error trap (here the heap lookup inside `free()`).
 - **Guest registers from a live process**: scan the host's committed memory for an
   `R5900Context` (32 × 16-byte GPRs, then `pc` at +512) whose `pc` is the stuck address and whose
-  `$ra` is a guest code address; then read `$sp` and the stack from RDRAM (`tools/guest_mem.py`
+  `$ra` is a guest code address; then read `$sp` and the stack from RDRAM (`tools/ports/guest_mem.py`
   finds RDRAM). That gave the bad pointer and the caller without a rebuild.
 - **Wrap a suspect game function** with an override that logs its inputs and outputs, and recompute
   the result in Python from a RAM dump.
