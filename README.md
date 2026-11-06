@@ -7,6 +7,15 @@ Also check our [WIKI](https://github.com/ran-j/PS2Recomp/wiki)
 
 This project statically recompiles PS2 ELF binaries into C++ and provides a runtime to execute the generated code.
 
+> **This fork (`ps2-ports` branch)** carries runtime and recompiler fixes shared by several game
+> ports (Midnight Club: Street Racing, This Is Football 2005). Rules for this branch:
+> - Only fixes that make the emulation behave more like a real PS2 go here; game-specific hooks
+>   stay in each game's own repository (`runtime.replaceFunction` overrides).
+> - Each game uses its own checkout of this fork (a submodule pinned to a commit) and moves to a
+>   newer commit when it is ready, so one port's work can't break another's build.
+> - Switches and log tags use neutral names (`PS2X_...`), not a game's.
+> - Read [docs/PS2_PORT_PLAYBOOK.md](docs/PS2_PORT_PLAYBOOK.md) before starting a port.
+
 ### Modules
 
 * `ps2xAnalyzer`: scans ELF/functions and writes TOML config (`stubs`, `skip`, instruction patches).
