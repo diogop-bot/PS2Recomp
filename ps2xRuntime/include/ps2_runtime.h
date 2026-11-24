@@ -385,6 +385,14 @@ public:
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+    // Keeps callback/invocation stacks below `ceiling` (the base of a guest stack that lives in
+    // their region, e.g. a main thread stack at the top of RAM set up by SetupThread).
+    void limitAsyncCallbackStacks(uint32_t ceiling);
+    // Places the callback/invocation stack region at [floor, top) (e.g. the unused kernel area
+    // 0x80000-0x100000, so a game can have the top of RAM). Call it before any guest code runs
+    // (from a game override): stacks already handed out stay where they are. Returns false and
+    // changes nothing if the range is empty, outside RAM, or a stack was already reserved.
+    bool setAsyncCallbackStackRange(uint32_t floor, uint32_t top);
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
 
@@ -517,6 +525,7 @@ private:
     bool m_guestHeapConfigured = false;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    bool m_asyncCallbackStackReserved = false; // set by the first reserveAsyncCallbackStack
 
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};

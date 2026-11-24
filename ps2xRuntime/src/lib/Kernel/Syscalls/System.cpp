@@ -531,6 +531,16 @@ namespace ps2_syscalls
         }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
+
+        // Callback/invocation stacks are carved top-down from the top of RAM. An explicit main
+        // stack placed there (This Is Football 2005's crt0: stack 0x1FF4000, size 0xC000) must
+        // keep them below it, or every interrupt handler and RPC end callback writes over the
+        // main thread's live frames (it lost a saved $ra and jumped to 0x280). The automatic
+        // (-1) stack above is already placed below that area.
+        if (stack != 0u && stack != 0xFFFFFFFFu)
+        {
+            runtime->limitAsyncCallbackStacks(stack);
+        }
         setReturnU32(ctx, sp);
     }
 

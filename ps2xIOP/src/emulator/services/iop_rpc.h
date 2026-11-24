@@ -68,10 +68,20 @@ namespace ps2x::iop::detail
             uint32_t queue = 0;
         };
 
+        // An IOP client (t_SifRpcClientData in IOP RAM) bound to a server the EE registered.
+        struct EeClient
+        {
+            uint32_t sid = 0;
+            bool busy = false;  // a call is queued on the EE (sceSifCheckStatRpc)
+            int doneFlag = 0;   // internal event flag a blocking call waits on
+        };
+
         IopHost &m_host;
         IopMemory &m_memory;
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
+        std::unordered_map<uint32_t, EeClient> m_eeClients;
+        uint64_t m_generation = 0; // bumped by reset(); EE replies from before it are dropped
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
     };

@@ -377,7 +377,10 @@ def lower_code(lo, pc):
             set_vi(vit, str((pc + 16) // 8))
         branch = ('always', None, target)
     elif hi in (0x24, 0x25):
-        lines.append('const uint32_t jt = (static_cast<uint32_t>(static_cast<uint16_t>(rb(%d))) * 8u) & 0x3FFFu;' % vis)
+        # JR/JALR read the live VI (PCSX2 microVU and interpreter): the "old VI" branch quirk is
+        # for the conditional branches only.
+        lines.append('const uint32_t jt = (static_cast<uint32_t>(static_cast<uint16_t>(%s)) * 8u) & 0x3FFFu;'
+                     % ('vi[%d]' % vis if vis else '0'))
         if hi == 0x25:
             set_vi(vit, str((pc + 16) // 8))
         branch = ('jump', None, None)

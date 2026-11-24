@@ -157,6 +157,7 @@ struct RpcServerState
 {
     uint32_t sid = 0;
     uint32_t sd_ptr = 0; // PS2 address
+    bool ee_registered = false; // an EE sceSifRegisterRpc server, not an IOP-side descriptor
 };
 
 struct RpcClientState
@@ -205,7 +206,14 @@ static constexpr uint32_t kSifRpcDebugFlagUnhandled = 1u << 6;
 static constexpr uint32_t kSifRpcDebugFlagFallbackCopy = 1u << 7;
 static constexpr uint32_t kSifRpcDebugFlagFallbackZero = 1u << 8;
 
+// g_rpc_servers: the descriptors EE clients bind to. Normally IOP-side (an IRX or HLE route owns
+// the SID); an EE-registered server stands in ("hybrid" backend) only while no IOP server owns it.
+// g_rpc_ee_servers: every server the EE registered with sceSifRegisterRpc, reachable by IOP clients
+// (an IRX's sceSifBindRpc/sceSifCallRpc). SIDs are per side on hardware, and a game may use one on
+// both (This Is Football 2005: 0x791 is PACKFS.IRX's server and also the EE server PACKFS and
+// STREAM.IRX report back to).
 inline std::unordered_map<uint32_t, RpcServerState> g_rpc_servers;
+inline std::unordered_map<uint32_t, RpcServerState> g_rpc_ee_servers;
 inline std::unordered_map<uint32_t, RpcClientState> g_rpc_clients;
 inline SifRpcDebugEvent g_sif_rpc_debug_history[kSifRpcDebugHistoryCount]{};
 inline uint64_t g_sif_rpc_debug_next_seq = 0;

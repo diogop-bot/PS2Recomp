@@ -5,6 +5,8 @@
 #include "ps2_vu1_detail.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -12,6 +14,8 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <string>
+#include <vector>
 #include <ps2_log.h>
 
 namespace
@@ -19,6 +23,111 @@ namespace
     constexpr uint8_t laneForComponent(uint32_t component)
     {
         return static_cast<uint8_t>(1u << (3u - component));
+    }
+
+    // PS2X_XGKICK_DUMP=<file>: on the first XGKICK packet that overflows the PATH1 buffer, write the
+    // GIFtags walked (packet offset, VU address, tag) and the VU1 data memory at that moment.
+    struct XgkickTagTrace
+    {
+        uint32_t packetOffset;
+        uint32_t vuAddress;
+        uint64_t tagLo;
+        uint64_t tagHi;
+        uint64_t cycle;
+    };
+    std::vector<XgkickTagTrace> s_xgkickTags;
+    uint32_t s_xgkickStartPc = 0u;
+    int32_t s_xgkickVi[16] = {};
+    uint32_t s_xgkickTop = 0u, s_xgkickItop = 0u;
+    const uint8_t *s_lastVuCode = nullptr;
+    uint32_t s_lastVuCodeSize = 0u;
+    std::atomic<bool> s_xgkickDumped{false};
+
+    void noteXgkickOverflow(uint32_t sourceAddress)
+    {
+        static std::atomic<uint32_t> s_overflows{0};
+        const uint32_t n = s_overflows.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (n <= 20u || (n & (n - 1u)) == 0u)
+            std::fprintf(stderr, "[vu1] XGKICK from 0x%X (kick pc 0x%X) has no EOP within 64 KB: packet dropped (%u so far)%c",
+                         sourceAddress, s_xgkickStartPc, n, 10);
+    }
+
+    // PS2X_VU1_TRACE=<file>: per-instruction trace of VU1 micro programs. It arms when a run starts
+    // at PS2X_VU1_TRACE_PC (default: any start), after skipping PS2X_VU1_TRACE_SKIP such starts, and
+    // then logs PS2X_VU1_TRACE_MAX pairs (default 200000) across later resumes (MSCNT) too. Each line:
+    // cycle, pc, lower/upper words, and the VI registers that changed since the previous line. When
+    // it arms it also writes <file>.vucode/.vumem and the VF/VI state, so the run can be replayed.
+    struct Vu1TraceConfig
+    {
+        FILE *file = nullptr;
+        long startPc = -1;
+        long skip = 0;
+        long remaining = 0;
+        bool armed = false;
+        int32_t lastVi[16] = {};
+    };
+    Vu1TraceConfig &vu1Trace()
+    {
+        static Vu1TraceConfig cfg = []
+        {
+            Vu1TraceConfig c;
+            const char *path = std::getenv("PS2X_VU1_TRACE");
+            if (!path || !*path)
+                return c;
+            c.file = std::fopen(path, "w");
+            if (const char *e = std::getenv("PS2X_VU1_TRACE_PC"))
+                c.startPc = std::strtol(e, nullptr, 0);
+            if (const char *e = std::getenv("PS2X_VU1_TRACE_SKIP"))
+                c.skip = std::strtol(e, nullptr, 0);
+            c.remaining = 200000;
+            if (const char *e = std::getenv("PS2X_VU1_TRACE_MAX"))
+                c.remaining = std::strtol(e, nullptr, 0);
+            return c;
+        }();
+        return cfg;
+    }
+
+    void dumpXgkickOverflow(const uint8_t *vuData, uint32_t vuDataSize, uint32_t sourceAddress, uint64_t issueCycle,
+                            uint64_t cycle, uint32_t pc)
+    {
+        const char *path = std::getenv("PS2X_XGKICK_DUMP");
+        if (!path || !*path || s_xgkickDumped.exchange(true))
+            return;
+        if (FILE *f = std::fopen(path, "w"))
+        {
+            std::fprintf(f, "xgkick source=0x%X issueCycle=%llu nowCycle=%llu kickPc=0x%X nowPc=0x%X tags=%zu\n",
+                         sourceAddress, static_cast<unsigned long long>(issueCycle), static_cast<unsigned long long>(cycle),
+                         s_xgkickStartPc, pc, s_xgkickTags.size());
+            for (const XgkickTagTrace &t : s_xgkickTags)
+                std::fprintf(f, "tag off=0x%05X vu=0x%04X cycle=%llu lo=%016llX hi=%016llX\n", t.packetOffset, t.vuAddress,
+                             static_cast<unsigned long long>(t.cycle), static_cast<unsigned long long>(t.tagLo),
+                             static_cast<unsigned long long>(t.tagHi));
+            std::fclose(f);
+        }
+        if (FILE *f = std::fopen(path, "a"))
+        {
+            std::fprintf(f, "at kick: top=0x%X itop=0x%X", s_xgkickTop, s_xgkickItop);
+            for (int i = 0; i < 16; ++i)
+                std::fprintf(f, " vi%d=0x%X", i, static_cast<unsigned>(s_xgkickVi[i]) & 0xFFFFu);
+            std::fprintf(f, "%c", 10);
+            std::fclose(f);
+        }
+        if (s_lastVuCode && s_lastVuCodeSize)
+        {
+            const std::string code = std::string(path) + ".vucode";
+            if (FILE *f = std::fopen(code.c_str(), "wb"))
+            {
+                std::fwrite(s_lastVuCode, 1, s_lastVuCodeSize, f);
+                std::fclose(f);
+            }
+        }
+        const std::string bin = std::string(path) + ".vumem";
+        if (FILE *f = std::fopen(bin.c_str(), "wb"))
+        {
+            std::fwrite(vuData, 1, vuDataSize, f);
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "[vu1] XGKICK overflow dumped to %s (+.vumem)\n", path);
     }
 }
 
@@ -654,6 +763,34 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
 
 void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
+    // PS2X_VU1_STORE_WATCH=<byte address>: log VU1 stores to the quadword holding it (first 100).
+    static const long storeWatch = []
+    {
+        const char *e = std::getenv("PS2X_VU1_STORE_WATCH");
+        return e && *e ? std::strtol(e, nullptr, 0) : -1L;
+    }();
+    static const long vu0StoreWatch = []
+    {
+        const char *e = std::getenv("PS2X_VU0_DATA_WATCH");
+        return e && *e ? std::strtol(e, nullptr, 0) : -1L;
+    }();
+    if (vu0StoreWatch >= 0 && m_unit == Unit::VU0 && (address & ~15u) == (static_cast<uint32_t>(vu0StoreWatch) & ~15u))
+    {
+        static std::atomic<int> logged0{0};
+        if (logged0.fetch_add(1) < 200)
+            std::fprintf(stderr, "[vu0:store] pc=0x%X addr=0x%X mask=0x%X %08X %08X %08X %08X vi14=%X%c", m_state.pc, address,
+                         laneMask, words[0], words[1], words[2], words[3], m_state.vi[14] & 0xFFFF, 10);
+    }
+    if (storeWatch >= 0 && m_unit == Unit::VU1 && (address & ~15u) == (static_cast<uint32_t>(storeWatch) & ~15u))
+    {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 100)
+            std::fprintf(stderr, "[vu1:store] pc=0x%X cycle=%llu addr=0x%X mask=0x%X %08X %08X %08X %08X vi=%X,%X,%X,%X,%X,%X,%X,%X%c",
+                         m_state.pc, static_cast<unsigned long long>(m_cycle), address, laneMask, words[0], words[1],
+                         words[2], words[3], m_state.vi[1] & 0xFFFF, m_state.vi[2] & 0xFFFF, m_state.vi[3] & 0xFFFF,
+                         m_state.vi[4] & 0xFFFF, m_state.vi[5] & 0xFFFF, m_state.vi[6] & 0xFFFF, m_state.vi[7] & 0xFFFF,
+                         m_state.top, 10);
+    }
     for (PendingStore &store : m_storePipeline)
     {
         if (!store.valid)
@@ -851,7 +988,10 @@ void VU1Interpreter::progressXgkick()
         m_xgkick.cycleCredit -= 2u;
         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
         {
-            reportReservedInstruction(false, 0xFFFFFFFBu);
+            // No EOP within the 64 KB PATH1 buffer: drop the packet but keep VU1 running (hardware
+            // does not stop the VU; halting here left every later MSCNT doing nothing).
+            dumpXgkickOverflow(m_activeVuData, m_activeVuDataSize, m_xgkick.sourceAddress, m_xgkick.issueCycle, m_cycle, m_state.pc);
+            noteXgkickOverflow(m_xgkick.sourceAddress);
             m_xgkick.active = false;
             return;
         }
@@ -888,9 +1028,17 @@ void VU1Interpreter::progressXgkick()
                 return;
             }
 
+            if (s_xgkickTags.size() < 4096u)
+            {
+                uint64_t tagHi = 0;
+                std::memcpy(&tagHi, m_xgkick.packet.data() + qwordOffset + 8u, sizeof(tagHi));
+                s_xgkickTags.push_back({qwordOffset, (m_xgkick.sourceAddress + qwordOffset) % m_activeVuDataSize, tagLo,
+                                        tagHi, m_cycle});
+            }
             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
             {
-                reportReservedInstruction(false, 0xFFFFFFFBu);
+                dumpXgkickOverflow(m_activeVuData, m_activeVuDataSize, m_xgkick.sourceAddress, m_xgkick.issueCycle, m_cycle, m_state.pc);
+                noteXgkickOverflow(m_xgkick.sourceAddress);
                 m_xgkick.active = false;
                 return;
             }
@@ -937,6 +1085,11 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
     m_xgkick.issueCycle = m_cycle;
+    s_xgkickTags.clear();
+    s_xgkickStartPc = m_state.pc;
+    std::memcpy(s_xgkickVi, m_state.vi, sizeof(s_xgkickVi));
+    s_xgkickTop = m_state.top;
+    s_xgkickItop = m_state.itop;
 }
 
 void VU1Interpreter::advanceOneCycle()
@@ -1624,6 +1777,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    s_lastVuCode = vuCode;
+    s_lastVuCodeSize = codeSize;
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
     m_activeGs = &gs;
@@ -1634,7 +1789,93 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const unsigned int savedCsr = _mm_getcsr();
     _mm_setcsr((savedCsr & ~0x6000u) | 0x6000u);
     const uint64_t budgetEnd = m_cycle + maxCycles;
+    const uint64_t runStartCycle = m_cycle;
+    const uint32_t runStartPc = m_state.pc;
+    uint32_t runTopWords[4] = {};
+    if (dataSize >= 16u)
+        std::memcpy(runTopWords, vuData + ((m_state.top * 16u) & (dataSize - 1u) & ~15u), sizeof(runTopWords));
     bool programEnded = false;
+    Vu1TraceConfig &trace = vu1Trace();
+    // PS2X_VU1_TRACE_DATA=<byte addr>,<word>: only arm when that VU1 data word holds that value
+    // (for example a model matrix entry, to catch one kind of object).
+    static const std::pair<long, uint32_t> traceData = []
+    {
+        const char *e = std::getenv("PS2X_VU1_TRACE_DATA");
+        if (!e || !*e)
+            return std::pair<long, uint32_t>{-1, 0u};
+        char *end = nullptr;
+        const long addr = std::strtol(e, &end, 0);
+        const uint32_t value = (end && *end == ',') ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0)) : 0u;
+        return std::pair<long, uint32_t>{addr, value};
+    }();
+    // PS2X_VU1_TRACE_AFTER=<cycle>: only arm once the run's cycle counter (since the last MSCAL)
+    // has reached that value.
+    static const unsigned long long traceAfter = []
+    {
+        const char *e = std::getenv("PS2X_VU1_TRACE_AFTER");
+        return e && *e ? std::strtoull(e, nullptr, 0) : 0ull;
+    }();
+    // PS2X_VU1_TRACE_AFTER_SEC=<s>: only arm once that many seconds have passed since the first VU1
+    // run (the cycle counter restarts at every MSCAL, so it is no clock).
+    static const double traceAfterSec = []
+    {
+        const char *e = std::getenv("PS2X_VU1_TRACE_AFTER_SEC");
+        return e && *e ? std::strtod(e, nullptr) : 0.0;
+    }();
+    static const auto traceClockStart = std::chrono::steady_clock::now();
+    bool traceDataMatch = m_cycle >= traceAfter &&
+                          (traceAfterSec <= 0.0 ||
+                           std::chrono::duration<double>(std::chrono::steady_clock::now() - traceClockStart).count() >= traceAfterSec);
+    if (trace.file && traceAfterSec > 0.0 && traceDataMatch)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::fprintf(stderr, "[vu1:trace] time condition met: unit=%d start=0x%X armed=%d remaining=%ld skip=%ld startPc=%ld%c",
+                         m_unit == Unit::VU1 ? 1 : 0, runStartPc, trace.armed ? 1 : 0, trace.remaining, trace.skip,
+                         trace.startPc, 10);
+        }
+    }
+    if (traceData.first >= 0 && static_cast<uint32_t>(traceData.first) + 4u <= dataSize)
+    {
+        uint32_t word = 0;
+        std::memcpy(&word, vuData + traceData.first, sizeof(word));
+        traceDataMatch = traceDataMatch && word == traceData.second;
+    }
+    if (trace.file && m_unit == Unit::VU1 && !trace.armed && trace.remaining > 0 &&
+        (trace.startPc < 0 || runStartPc == static_cast<uint32_t>(trace.startPc)) && traceDataMatch &&
+        trace.skip-- <= 0)
+    {
+        trace.armed = true;
+        std::fprintf(trace.file, "# armed: start=0x%X top=0x%X itop=0x%X cycle=%llu%c", runStartPc, m_state.top,
+                     m_state.itop, static_cast<unsigned long long>(m_cycle), 10);
+        for (int r = 0; r < 32; ++r)
+        {
+            uint32_t w[4];
+            std::memcpy(w, m_state.vf[r], sizeof(w));
+            std::fprintf(trace.file, "# vf%02d %08X %08X %08X %08X%c", r, w[0], w[1], w[2], w[3], 10);
+        }
+        for (int r = 0; r < 16; ++r)
+        {
+            trace.lastVi[r] = m_state.vi[r];
+            std::fprintf(trace.file, "# vi%02d %04X%c", r, static_cast<unsigned>(m_state.vi[r]) & 0xFFFFu, 10);
+        }
+        const char *path = std::getenv("PS2X_VU1_TRACE");
+        if (FILE *f = std::fopen((std::string(path) + ".vucode").c_str(), "wb"))
+        {
+            std::fwrite(vuCode, 1, codeSize, f);
+            std::fclose(f);
+        }
+        if (FILE *f = std::fopen((std::string(path) + ".vumem").c_str(), "wb"))
+        {
+            std::fwrite(vuData, 1, dataSize, f);
+            std::fclose(f);
+        }
+    }
+    else if (trace.armed && trace.remaining > 0)
+        std::fprintf(trace.file, "# resume: pc=0x%X top=0x%X itop=0x%X cycle=%llu%c", runStartPc, m_state.top,
+                     m_state.itop, static_cast<unsigned long long>(m_cycle), 10);
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         commitReadyPipelines();
@@ -1642,6 +1883,20 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
 
         const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        if (trace.armed && trace.remaining > 0 && m_unit == Unit::VU1)
+        {
+            std::fprintf(trace.file, "%llu %04X %08X %08X", static_cast<unsigned long long>(m_cycle), m_state.pc,
+                         decoded.lower, decoded.upper);
+            for (int r = 1; r < 16; ++r)
+                if (m_state.vi[r] != trace.lastVi[r])
+                {
+                    trace.lastVi[r] = m_state.vi[r];
+                    std::fprintf(trace.file, " vi%d=%X", r, static_cast<unsigned>(m_state.vi[r]) & 0xFFFFu);
+                }
+            std::fprintf(trace.file, "%c", 10);
+            if (--trace.remaining == 0)
+                std::fflush(trace.file);
+        }
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
@@ -1826,6 +2081,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
     }
 
+    if (trace.armed && trace.file && m_unit == Unit::VU1)
+    {
+        std::fprintf(trace.file, "# stop: pc=0x%X ended=%d budget=%d cycle=%llu%c", m_state.pc, programEnded ? 1 : 0,
+                     m_cycle >= budgetEnd ? 1 : 0, static_cast<unsigned long long>(m_cycle), 10);
+        std::fflush(trace.file);
+        // The first run's data memory at its end (<file>.end.vumem): inputs at arm time vs outputs here.
+        static bool endDumped = false;
+        if (!endDumped)
+        {
+            endDumped = true;
+            if (FILE *f = std::fopen((std::string(std::getenv("PS2X_VU1_TRACE")) + ".end.vumem").c_str(), "wb"))
+            {
+                std::fwrite(vuData, 1, dataSize, f);
+                std::fclose(f);
+            }
+        }
+    }
     if (programEnded)
     {
         flushPipelines();
@@ -1833,6 +2105,55 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_state.haltAfterDelaySlot = false;
         m_pendingHaltD = false;
         m_pendingHaltT = false;
+    }
+    else if (m_cycle >= budgetEnd)
+    {
+        // The program is cut off mid-run (no E bit within the budget): whatever it had not
+        // XGKICKed yet is lost. Report the first cases so a port can raise the budget.
+        static std::atomic<uint32_t> s_budgetHits{0};
+        const uint32_t n = s_budgetHits.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (n <= 10u || (n & (n - 1u)) == 0u)
+            std::fprintf(stderr, "[vu1] program stopped by the %u-cycle budget at pc 0x%X (%u times so far)\n",
+                         maxCycles, m_state.pc, n);
+    }
+    // PS2X_VU1_LONG_RUNS=1: describe programs that ran more than 100000 cycles (first 40).
+    static const bool logLongRuns = std::getenv("PS2X_VU1_LONG_RUNS") != nullptr;
+    static const long watchRunPc = []
+    {
+        const char *e = std::getenv("PS2X_VU1_RUN_PC");
+        return e && *e ? std::strtol(e, nullptr, 0) : -1L;
+    }();
+    if (m_unit == Unit::VU1 && ((logLongRuns && m_cycle - runStartCycle > 100000u) ||
+                                (watchRunPc >= 0 && runStartPc == static_cast<uint32_t>(watchRunPc))))
+    {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 40)
+            std::fprintf(stderr, "[vu1:long] start=0x%X end=0x%X cycles=%llu top=0x%X itop=0x%X [top]=%08X %08X %08X %08X%c",
+                         runStartPc, m_state.pc, static_cast<unsigned long long>(m_cycle - runStartCycle), m_state.top,
+                         m_state.itop, runTopWords[0], runTopWords[1], runTopWords[2], runTopWords[3], 10);
+    }
+    // PS2X_VU1_BUDGET_DUMP=<file>: at the first budget stop write VU1 code (<file>.vucode) and data
+    // (<file>.vumem).
+    if (m_unit == Unit::VU1 && m_cycle >= budgetEnd)
+    {
+        static std::atomic<bool> dumped{false};
+        const char *dumpPath = std::getenv("PS2X_VU1_BUDGET_DUMP");
+        if (dumpPath && *dumpPath && !dumped.exchange(true))
+        {
+            const std::string base(dumpPath);
+            if (FILE *f = std::fopen((base + ".vucode").c_str(), "wb"))
+            {
+                std::fwrite(vuCode, 1, codeSize, f);
+                std::fclose(f);
+            }
+            if (FILE *f = std::fopen((base + ".vumem").c_str(), "wb"))
+            {
+                std::fwrite(vuData, 1, dataSize, f);
+                std::fclose(f);
+            }
+            std::fprintf(stderr, "[vu1] budget stop: VU1 memory dumped to %s.vucode/.vumem (start 0x%X, now 0x%X)%c",
+                         dumpPath, runStartPc, m_state.pc, 10);
+        }
     }
     m_state.cycles = m_cycle;
     _mm_setcsr(savedCsr);

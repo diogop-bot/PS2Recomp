@@ -370,6 +370,17 @@ namespace
         RotateThreadReadyQueue(rdram, ctx, runtime);
     }
 
+    void schedulerRotateAlone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gSchedulerTrace->push_back(10);
+        ctx->pc = K_SCHED_A_RESUME;
+        setRegU32(*ctx, 4, 5u);
+        RotateThreadReadyQueue(rdram, ctx, runtime);
+        gSchedulerTrace->push_back(12); // only reached when the rotation did not transfer
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     void schedulerRotateAResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
         gSchedulerTrace->push_back(11);
@@ -630,6 +641,24 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(semaphore->option, semaParam.option, "semaphore option must be decoded from offset 0x14");
         });
 
+        tc.Run("EE thread priorities span 0 (highest) to 127", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            constexpr int kIllegalPriority = -403;
+            const int top = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 0, 0});
+            t.IsTrue(top >= 2, "priority 0 is a valid EE thread priority (This Is Football 2005 uses it)");
+            const int bottom = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x21000u, 0x800u, 0, 127, 0});
+            t.IsTrue(bottom >= 2, "priority 127 is a valid EE thread priority");
+            t.Equals(ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x22000u, 0x800u, 0, 128, 0}), kIllegalPriority,
+                     "priority 128 is out of range");
+            t.Equals(ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x22000u, 0x800u, 0, -1, 0}), kIllegalPriority,
+                     "negative priorities are out of range");
+            int oldPriority = -1;
+            t.Equals(ee.changePriority(bottom, 0, false, oldPriority), KE_OK, "ChangeThreadPriority accepts 0");
+            t.Equals(oldPriority, 127, "ChangeThreadPriority reports the previous priority");
+        });
+
         tc.Run("EE scheduler selects absolute priority then FIFO", [](TestCase &t)
         {
             TestEnv env;
@@ -831,6 +860,26 @@ void register_ps2_runtime_kernel_tests()
 
             const std::vector<int> expected{1, 10, 20, 11};
             t.IsTrue(trace == expected, "explicit rotation should move the current head behind its FIFO peer");
+        });
+
+        tc.Run("RotateThreadReadyQueue alone at its priority keeps running without a transfer", [](TestCase &t)
+        {
+            TestEnv env;
+            std::vector<int> trace;
+            gSchedulerTrace = &trace;
+            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
+            env.runtime.registerFunction(K_SCHED_A, schedulerRotateAlone);
+            env.runtime.registerFunction(K_SCHED_A_RESUME, schedulerRotateAResume);
+            env.ctx.pc = K_SCHED_MAIN;
+
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            const int only = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 5, 0});
+            ee.startThread(only, 0, env.ctx, false);
+            ee.run();
+
+            const std::vector<int> expected{1, 10, 12};
+            t.IsTrue(trace == expected, "a lone thread's rotation is a no-op: it returns and keeps running");
         });
 
         tc.Run("starting a strictly higher-priority thread preempts immediately", [](TestCase &t)
@@ -1117,6 +1166,43 @@ void register_ps2_runtime_kernel_tests()
                      "main thread status must preserve SetupThread's global pointer");
             t.IsTrue(status.stack != kInitialLoaderSp && status.stack != kTransientSp,
                      "main thread status must never expose a live stack-pointer snapshot");
+        });
+
+        tc.Run("an explicit main stack at the top of RAM keeps callback stacks below it", [](TestCase &t)
+        {
+            // This Is Football 2005's crt0: SetupThread(gp, 0x1FF4000, 0xC000) -> sp 0x2000000.
+            TestEnv env;
+            constexpr uint32_t kStackBase = PS2_RAM_SIZE - 0xC000u;
+            env.ctx.pc = 0x00100000u;
+            setRegU32(env.ctx, 29, PS2_RAM_SIZE - 0x10u);
+            setRegU32(env.ctx, 4, 0x005E12F0u);
+            setRegU32(env.ctx, 5, kStackBase);
+            setRegU32(env.ctx, 6, 0xC000u);
+            t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
+                     "SetupThread syscall should dispatch");
+            t.Equals(::getRegU32(&env.ctx, 2), PS2_RAM_SIZE, "the explicit stack's top is the new $sp");
+
+            const uint32_t callbackTop = env.runtime.reserveAsyncCallbackStack(0x4000u, 16u);
+            t.IsTrue(callbackTop != 0u, "a callback stack should still be available");
+            t.IsTrue(callbackTop <= kStackBase,
+                     "callback stacks must not overlap the main thread's stack");
+        });
+
+        tc.Run("callback stacks can be moved to the kernel area before the first one is handed out", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(!env.runtime.setAsyncCallbackStackRange(0x100000u, 0xC0000u), "an empty range is refused");
+            t.IsTrue(env.runtime.setAsyncCallbackStackRange(0xC0000u, 0x100000u), "the kernel-area range is accepted");
+            const uint32_t first = env.runtime.reserveAsyncCallbackStack(0x4000u, 16u);
+            t.Equals(first, 0x100000u - 0x10u, "the first stack sits at the new top");
+            const uint32_t second = env.runtime.reserveAsyncCallbackStack(0x4000u, 16u);
+            t.Equals(second, 0xFC000u - 0x10u, "stacks are handed out downwards inside the range");
+            t.IsTrue(!env.runtime.setAsyncCallbackStackRange(0x80000u, 0xC0000u),
+                     "the range cannot move once a stack is in use");
+            int handedOut = 2;
+            while (env.runtime.reserveAsyncCallbackStack(0x4000u, 16u) != 0u)
+                ++handedOut;
+            t.Equals(handedOut, 16, "the range holds exactly its 16 stacks, never more");
         });
 
         tc.Run("OSD config2 syscalls round-trip extended config", [](TestCase &t)

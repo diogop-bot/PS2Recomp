@@ -148,6 +148,7 @@ All fixed in our fork (`diogop-bot/PS2Recomp`, branch `midnightclub-fixes`; the 
 | `sceMcGetDir` ignored flags (continue) | save list showed one profile | keep the listing, resume on flags != 0 |
 | `sceSifFreeIopHeap` is game code that RPCs an IOP heap server the HLE lacks | IOP memory leaked per movie; race music buffer failed; menu hang after a race | bind it to the runtime's free |
 | VIF1 `DIRECT` + `IMAGE` split across two DMA pieces | every texture shifted 8 bytes: colours rotated (yellow → purple), VU code corrupted | take the image data from the next DIRECT payload |
+| SPR DMA to/from VU memory (MADR `0x11004000`) dropped; VIF0 stateless across transfers | This Is Football: animated bone palette never reached VU0, players skinned with a static palette (section 13) | map VU memory in the SPR engine; keep incomplete VIF0 codes for the next transfer |
 | GIF arbiter lost path ids | PCSX2 needs per-path state | pass `GifPathId` to the consumer |
 | Pad ignored the keyboard when a gamepad was connected | automation key presses vanished | always read both |
 | Tail jumps (`j func`) are emitted as direct C calls | `replaceFunction` on a game function silently misses every caller that tail-jumps into it (here 170+ callers of `free`) | override a function reached only through `jal` (check `grep "FUN_x_0xx(rdram"` in `generated/` finds no direct callers), or one level deeper |
@@ -349,3 +350,79 @@ Architecture (`src/gs/`, `src/mc_gs_bridge.cpp`):
   still unknown (watch `MC_WATCH=2C4128:4`). It doesn't happen every session.
 - New York at x2 draw distance: ~34 fps in the worst spot (GS worker 92% busy in VU1 programs).
 - Movies (FFmpeg is in `third_party/ffmpeg`), true widescreen.
+
+---
+
+## 13. Lessons from This Is Football 2005 (second port, 2026-11)
+
+Fixed in the fork (`ps2-ports`). Tests in `ps2xTest` cover JR/JALR, the IPU, a VIF1 chain from
+TADR `0x80000000`, VCALLMSR and the VU0 macro loads/stores, SPR DMA to and from VU0 data, and a
+VIF0 UNPACK split between the FIFO and a DMA, VIF0 MSCAL. Not covered yet: the XGKICK drop and the
+`sceDmaSend`/`toDmaPhys` path.
+The JR/JALR change does not affect Midnight Club: its microcode never writes a VI right before a
+JR/JALR on it (scanned 2026-11-14). The `vu1_recompile.py` edit was checked only by reading the
+generated line, not through the bench or verify mode. The generator also rejects TIF's
+microcode: it doesn't support an E bit on a branch.
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| JR/JALR used the "branch reads the pre-write VI" quirk | `IADDIU vi01, vi00, 0` + `JALR vi15, vi01` jumped to the old vi01 (a stack pointer): VU1 ran garbage for millions of cycles, stored all over VU memory, match drew nothing | only IBEQ/IBNE/IBxxZ read the old VI; JR/JALR read the live register (PCSX2 microVU `mVUanalyzeJump` and interpreter `_vuJR` agree). Upstream f49ca4e asserted the opposite in a test: keep this when merging. Same fix in `tools/ports/vu1/vu1_recompile.py` |
+| An XGKICK with no EOP halted VU1 for good (`m_stopRequested`, never cleared by `resume`) | one bad packet, then every later MSCNT ran zero instructions | drop the packet, log it, keep running to the E bit |
+| DMA addresses `0x80000000 \| offset` (scratchpad, hardware form) read RDRAM | the game's VU1 init packet (EOP GIFtag at VU1 qw0, stack pointer at qw 0x3F9) built in scratchpad never arrived; every "empty" kick from qw0 walked garbage | translate bit-31 addresses below 16 KB to `0x70000000 + offset` in `sceDmaSend` and in the VIF/GIF DMA engine (MADR, TADR, tag ADDR) |
+| Recompiler: `VCALLMSR` read `ctx->vi[27]` (past the 16-entry VI array, into VU0's R register) instead of CMSAR0 | every VU0 program started that way began at a garbage address; TIF's frustum test (VU0 0x5C0) never ran properly and ~95% of objects were culled (about 17 of ~300 per frame drew) | start at `ctx->vu0_cmsar0` (an instruction index, x8). Check any port that uses `vcallmsr`: `grep -c "ctx->vi\[27\]" generated/` |
+| No IPU | MPEG pictures magenta | `runtime/ps2_ipu.h` (core from PCSX2's IPU, GPL): synchronous, stalls re-run from the command start; IDEC forces PCT = I-picture like PCSX2 |
+| Recompiler: VU0 macro `VSQD`/`VSQI` swapped the VF and VI fields (and `VLQ*`/`VSQ*`/`VILWR`/`VISWR` addressed RAM, not VU0 data memory) | stores went to the wrong VU0 quadwords: the root bone of every skeleton was corrupted | VF = fs (rd field), VI = it (rt field); address `0x11004000 + (vi & 0xFF) * 16`; VI updates are 16-bit and never write vi0 |
+| Runtime: an SPR DMA whose MADR is VU memory (`0x11000000`-`0x1100FFFF`) was dropped (`translateAddress` gave 0x11004000, failing the RAM bounds check) | **players mangled** (stretched torsos, stick arms) in the front end and the match: TIF builds the animated bone palette (pose x inverse bind, `FUN_42D1A0`) in scratchpad and sends it to VU0 data with fromSPR, MADR `0x11004000` (`0x2B2E58`). VU0 kept a static palette, so every frame was skinned with it | `tryProcessScratchpadDma` maps VU memory through `mapVuMemory` first. The DMAC can address VU memory; any engine that resolves MADR (VIF/GIF normal and chain modes) should do the same |
+| Runtime: VIF0 parsed every FIFO write and DMA chunk on its own, and dropped `MSCAL` with the rest of the packet | the match sends `ITOP` + `UNPACK` + `MSCAL 0x100` + `FLUSHE` (i bit) through VIF0 every frame (a 60-element integration program at VU0 0x800, reading vf29-vf31 set by the EE); it never ran. Over 110 s runs the game stopped presenting frames in 2 of 3 runs with the old drop and 1 of 6 with MSCAL handled. A FIFO-written UNPACK whose data comes by DMA (`0x2B2340`, found by reading the code, not seen running) lost both header and data | VIF0 keeps an incomplete VIFcode and what has arrived of its payload until the next transfer; `MSCAL`/`MSCALF` run the VU0 program at once on the current EE context (`runtime/ps2_vif0_mscal.h`, installed by the runtime; `MSCNT` still unhandled); UNPACK wraps at 0x100 quadwords and decodes every format (8/16-bit with USN, S broadcast, V4-5, masks, modes; only V4-32 and S-16 are unit-tested). Not done for VIF1 (it logs drops with `PS2X_VIF1_DROP_LOG`). The VIF0 i bit is not raised as an interrupt |
+
+Method that worked for VU1 problems:
+1. `PS2X_VU1_LONG_RUNS=1` finds programs that never end. A `[VU1 reserved lower] 0xfffffffb` is an
+   overflowed XGKICK, not bad microcode (older logs).
+2. `PS2X_VU1_TRACE` from the program's entry, read with `tools/ports/vu1/vudis.py`. Look for the
+   first jump that lands somewhere the code does not lead.
+3. **Bisect VU memory with PCSX2 save states**: save at several screens and diff `vu1Memory.bin`
+   (and micro memory) against the port. A quadword PCSX2 has and the port never writes points to a
+   lost upload. Here VU1 qw0 was 0 at the language screen and during the movie, and 0x8000 by the
+   memory-card prompt, so the writer had to be in front-end init. Then search the ELF for the
+   UNPACK being built (`lui 0x6C00` / the destination immediate) and trace that function.
+4. **Count what the EE submits** before blaming VU1: search both RAM images for the per-object
+   upload VIFcode (here `0x6C0C0001`, the model + projection block) and compare counts and the
+   model matrices that follow. PCSX2 had ~300 per frame and the port 17, which moved the search to
+   EE-side culling. `tools/ports/guest_mem.py dump <file>` writes the port's 32 MB RDRAM in the same
+   layout as PCSX2's `eeMemory.bin`.
+5. **Check VU1 math offline**: `PS2X_VU1_TRACE` also writes `<file>.end.vumem` after the first
+   run, so the program's inputs (`.vumem`) and outputs can be compared with a numpy evaluation of
+   the same transform. Here they matched, which ruled out VU1 for the missing objects.
+6. Overlays are placed dynamically and patched per placement (`JALR` in one layout, `BAL` in
+   another), so compare code by content, not by address.
+
+Method that worked for wrong geometry (EE + VU0 skinning, 2026-11-24):
+1. Find the buffer VU1 draws from: decode the VIF1 packet (`UNPACK V3-16` REF tags) and watch a
+   word of it (`TIF_WATCH_WRITE`-style page-protect watch). The writer was a fromSPR DMA, so the
+   skinning ran in scratchpad (`0x2B0330` driver, `0x2B0120` pipelined EE loop + VU0 programs).
+2. Dump each call's inputs and outputs from a game-side wrapper (source, VU0 data, output), and
+   compare against PCSX2's `eeMemory.bin`: the source meshes matched, the output did not.
+3. Write the EE loop and VU0 programs as a small Python model (`vu0emu.py`-style) and run it on the
+   port's inputs. It reproduced the port, so the emulation was right and an **input** differed.
+4. The VU0 data was the same at every call while the game animated: the per-frame upload was
+   missing. Following the writer of VU0 data (the palette builder) found the dropped SPR DMA.
+5. PCSX2's VU0 *microcode* at an arbitrary save state may differ from the port's at a hooked call:
+   TIF swaps two VU0 code sets (pose and skinning) by MPG each frame. Compare code at the same
+   moment, or find the MPG source in RAM (here REF tags at `0x88B324`/`0x88B424`).
+
+Other notes:
+- `TIF_FAST_BOOT`-style shortcuts that skip screens can skip one-time init too. Check a lost write
+  without them before suspecting the runtime.
+- The 64 KB PATH1 buffer, the 16M-cycle VU1 budget and "reserved instruction" stops are all
+  runtime limits. When one fires, ask which earlier divergence led there.
+
+Rendering (2026-11-20): TIF now renders through PCSX2's GS the way Midnight Club does (section 6),
+by reusing MC's built `mc_gs.dll`. The fork's software GS was too slow for full-screen textured
+close-ups (a "freeze" at about one frame per 5 s) and got runtime-composited kits wrong.
+
+Port-side additions to MC's bridge:
+- GS-to-host readback through `mcgs_read_fifo`: post it to the GS worker, then `syncGsWorker`.
+- PNG snapshots of the presented frame (`mcgs_snapshot`) instead of window captures.
+
+Use the PCSX2 GS early in a new port: it separates "our GS is wrong" from "the data is wrong"
+for free.

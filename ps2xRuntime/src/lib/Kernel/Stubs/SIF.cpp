@@ -592,9 +592,21 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 
+    // On hardware sceSifRpcLoop(qd) never returns while its queue exists: the server thread sleeps
+    // until the SIF interrupt queues a request, runs the server function and sleeps again. Here
+    // requests run the server function directly (SifCallRpc dispatches it as an invocation), so the
+    // loop thread has nothing to do. Returning at once instead dropped it into the code after the
+    // call, typically `for (;;) {}`, which at a high priority starves every other EE thread. The
+    // thread now waits until sceSifRemoveRpcQueue removes its queue; WakeupThread does not end it.
     void sceSifRpcLoop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const uint32_t qd = getRegU32(ctx, 4);
         setReturnS32(ctx, 0);
+        if (qd == 0u)
+        {
+            return;
+        }
+        runtime->eeScheduler().waitExternal(EeWaitReason::External, ps2_syscalls::kSifRpcLoopWaitType, qd);
     }
 
     void sceSifSetCmdBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

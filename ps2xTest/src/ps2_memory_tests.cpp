@@ -1,5 +1,8 @@
 #include "MiniTest.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vif1_irq.h"
+#include "runtime/ps2_vif0_mscal.h"
+#include "runtime/ps2_dma_hook.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "ps2_runtime.h"
@@ -1079,6 +1082,351 @@ void register_ps2_memory_tests()
             t.Equals(firstBytes[1], static_cast<uint8_t>(0xD2u), "DIRECTHL packet should drain after PATH3 IMAGE packet");
         });
 
+        tc.Run("VIF1 interrupt bit calls the hook once, after its command, with CODE and MARK", [](TestCase &t)
+        {
+            struct Seen
+            {
+                uint32_t code, mark, row0;
+            };
+            static std::vector<Seen> seen;
+            seen.clear();
+
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            setVif1InterruptHook([](PS2Memory &m, uint32_t code, uint32_t mark)
+                                 {
+                                     seen.push_back({code, mark, m.vif1_regs.row[0]});
+                                     return true;
+                                 });
+
+            std::vector<uint8_t> vif;
+            appendU32(vif, makeVifCmd(0x07u, 0u, 0x0012u));              // MARK 0x12
+            appendU32(vif, makeVifCmd(0x13u, 0u, 0x3450u) | 0x80000000u); // FLUSHA, interrupt bit
+            appendU32(vif, makeVifCmd(0x30u, 0u, 0u));                    // STROW: runs after the hook
+            for (uint32_t i = 0; i < 4u; ++i)
+                appendU32(vif, 0x1111u * (i + 1u));
+            mem.processVIF1Data(vif.data(), static_cast<uint32_t>(vif.size()));
+            setVif1InterruptHook(nullptr);
+
+            t.Equals(seen.size(), static_cast<size_t>(1u), "hook should run once");
+            if (seen.empty())
+                return;
+            t.Equals(seen[0].code, 0x93003450u, "hook should get the VIFcode as VIF1_CODE");
+            t.Equals(seen[0].mark, 0x12u, "hook should get VIF1_MARK");
+            t.Equals(seen[0].row0, 0u, "hook should run before the next VIFcode");
+            t.Equals(mem.vif1_regs.row[0], 0x1111u, "the stream should continue after the hook");
+            t.Equals(mem.vif1_regs.stat & (1u << 11), 0u, "a handled interrupt should clear STAT.INT");
+        });
+
+        tc.Run("VIF1 interrupt bit at the end of the data and without a hook", [](TestCase &t)
+        {
+            static int calls = 0;
+            calls = 0;
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<uint8_t> vif;
+            appendU32(vif, makeVifCmd(0x00u, 0u, 0x1234u) | 0x80000000u); // NOP, interrupt bit, last
+            setVif1InterruptHook([](PS2Memory &, uint32_t, uint32_t)
+                                 {
+                                     ++calls;
+                                     return false;
+                                 });
+            mem.processVIF1Data(vif.data(), static_cast<uint32_t>(vif.size()));
+            t.Equals(calls, 1, "an interrupt on the last VIFcode should still call the hook");
+            t.IsTrue((mem.vif1_regs.stat & (1u << 11)) != 0u, "an unhandled interrupt should leave STAT.INT set");
+
+            setVif1InterruptHook(nullptr);
+            PS2Memory plain;
+            t.IsTrue(plain.initialize(), "PS2Memory initialize should succeed");
+            plain.processVIF1Data(vif.data(), static_cast<uint32_t>(vif.size()));
+            t.IsTrue((plain.vif1_regs.stat & (1u << 11)) != 0u, "without a hook STAT.INT should stay set");
+        });
+
+        tc.Run("processGifChainInline sends a cnt/ref/end GIF chain on PATH3", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::vector<std::vector<uint8_t>> packets;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+                                     { packets.emplace_back(data, data + sizeBytes); });
+
+            uint8_t *rdram = mem.getRDRAM();
+            const auto put64 = [&](uint32_t addr, uint64_t v)
+            { std::memcpy(rdram + addr, &v, 8); };
+            // 0x1000: cnt 1 qw (GIF tag) -> 0x1020: ref 2 qw at 0x2000 -> 0x1030: end 0
+            put64(0x1000u, 0x10000001ull);
+            put64(0x1010u, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true));
+            put64(0x1018u, 0ull);
+            put64(0x1020u, (static_cast<uint64_t>(0x2000u) << 32) | 0x30000002ull);
+            put64(0x1030u, 0x70000000ull);
+            for (uint32_t i = 0; i < 32u; ++i)
+                rdram[0x2000u + i] = static_cast<uint8_t>(0xA0u + i);
+
+            const uint32_t qw = processGifChainInline(mem, 0x1000u);
+            t.Equals(qw, 3u, "chain should send 3 qwords");
+            t.Equals(packets.size(), static_cast<size_t>(1u), "chain should go out as one packet");
+            if (packets.size() != 1u || packets[0].size() != 48u)
+                return;
+            uint64_t tag = 0;
+            std::memcpy(&tag, packets[0].data(), 8);
+            t.Equals(tag, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true), "first qword should be the cnt payload");
+            t.Equals(packets[0][16], static_cast<uint8_t>(0xA0u), "ref data should follow");
+            t.Equals(packets[0][47], static_cast<uint8_t>(0xBFu), "all ref data should be sent");
+        });
+
+        tc.Run("IPU DMA kick: a hook completes it and raises the DMAC cause; without one fromIPU waits for IPU output", [](TestCase &t)
+        {
+            struct Kick
+            {
+                uint32_t channel, madr, qwc;
+            };
+            static std::vector<Kick> kicks;
+            kicks.clear();
+
+            PS2Memory plain;
+            t.IsTrue(plain.initialize(), "PS2Memory initialize should succeed");
+            plain.writeIORegister(0x1000B010u, 0x00100000u);
+            plain.writeIORegister(0x1000B020u, 4u);
+            plain.writeIORegister(0x1000B000u, 0x100u);
+            t.IsTrue(plain.consumeCompletedDmacCauses().empty(), "without a hook no DMAC cause should be raised");
+
+            setDmaKickHook([](PS2Memory &, uint32_t channel, uint32_t madr, uint32_t qwc, uint32_t)
+                           {
+                               kicks.push_back({channel, madr, qwc});
+                               return true;
+                           });
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.writeIORegister(0x1000B410u, 0x00200000u);
+            mem.writeIORegister(0x1000B420u, 8u);
+            mem.writeIORegister(0x1000B400u, 0x101u);
+            setDmaKickHook(nullptr);
+
+            t.Equals(kicks.size(), static_cast<size_t>(1u), "hook should run once");
+            if (kicks.empty())
+                return;
+            t.Equals(kicks[0].channel, 4u, "0x1000B400 is channel 4");
+            t.Equals(kicks[0].madr, 0x00200000u, "hook should get MADR");
+            t.Equals(kicks[0].qwc, 8u, "hook should get QWC");
+            t.Equals(mem.readIORegister(0x1000B400u) & 0x100u, 0u, "a completed kick should clear STR");
+            t.Equals(mem.readIORegister(0x1000B420u), 0u, "a completed kick should clear QWC");
+            t.Equals(mem.readIORegister(0x1000B410u), 0x00200080u, "a completed kick should advance MADR");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 4)) != 0u, "D_STAT should flag channel 4");
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.IsTrue(causes.size() == 1u && causes[0] == 4u, "DMAC cause 4 should be queued");
+        });
+
+        // One intra macroblock with every DC difference 0 and no AC coefficients: macroblock_type '1',
+        // 4 x (luma dct_dc_size 0 '100', EOB '10'), 2 x (chroma dct_dc_size 0 '00', EOB '10'), then zero
+        // bits to the byte boundary. Y = Cb = Cr = 128 -> RGB (130, 130, 130), alpha 0x80.
+        const auto ipuFlatMacroblock = []()
+        {
+            std::vector<uint8_t> bytes;
+            uint32_t acc = 0, nbits = 0;
+            const auto put = [&](uint32_t value, uint32_t count)
+            {
+                for (uint32_t i = count; i-- > 0;)
+                {
+                    acc = (acc << 1) | ((value >> i) & 1u);
+                    if (++nbits == 8u)
+                    {
+                        bytes.push_back(static_cast<uint8_t>(acc));
+                        acc = 0;
+                        nbits = 0;
+                    }
+                }
+            };
+            put(1u, 1u);
+            for (int i = 0; i < 4; ++i)
+            {
+                put(0x4u, 3u);
+                put(0x2u, 2u);
+            }
+            for (int i = 0; i < 2; ++i)
+            {
+                put(0x0u, 2u);
+                put(0x2u, 2u);
+            }
+            if (nbits)
+                put(0u, 8u - nbits);
+            return bytes;
+        };
+
+        const auto expectGreyMacroblock = [](TestCase &t, const uint8_t *px, const char *what)
+        {
+            bool allGrey = true;
+            for (uint32_t i = 0; i < 256u; ++i)
+                allGrey = allGrey && px[i * 4u + 0u] == 130u && px[i * 4u + 1u] == 130u && px[i * 4u + 2u] == 130u &&
+                          px[i * 4u + 3u] == 0x80u;
+            t.IsTrue(allGrey, what);
+        };
+
+        tc.Run("IPU IDEC through DMA: a flat macroblock decodes to grey RGB32, ch3/ch4 complete, start code found", [=](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            uint8_t *rdram = mem.getRDRAM();
+            std::vector<uint8_t> stream = ipuFlatMacroblock();
+            const uint8_t startCode[4] = {0x00, 0x00, 0x01, 0xB0};
+            stream.insert(stream.end(), startCode, startCode + 4);
+            stream.resize(16u, 0u);
+            std::memcpy(rdram + 0x10000u, stream.data(), stream.size());
+
+            mem.writeIORegister(0x1000B010u, 0x20000u); // fromIPU: one RGB32 macroblock
+            mem.writeIORegister(0x1000B020u, 64u);
+            mem.writeIORegister(0x1000B000u, 0x100u);
+            t.Equals(mem.readIORegister(0x1000B000u) & 0x100u, 0x100u, "fromIPU should stay running until filled");
+            mem.writeIORegister(0x1000B410u, 0x10000u); // toIPU: the bitstream
+            mem.writeIORegister(0x1000B420u, 1u);
+            mem.writeIORegister(0x1000B400u, 0x101u);
+            t.Equals(mem.readIORegister(0x1000B400u) & 0x100u, 0u, "toIPU should complete once the IPU holds it all");
+
+            mem.writeIORegister(0x10002010u, 0u);          // CTRL: MPEG-2, 8-bit DC, linear quantiser
+            mem.writeIORegister(0x10002000u, 0x10000000u); // IDEC, RGB32
+            const uint32_t ctrl = mem.readIORegister(0x10002010u);
+            t.Equals(ctrl & 0x80000000u, 0u, "IDEC should finish");
+            t.Equals(ctrl & (1u << 15), 1u << 15, "IDEC should stop at a start code (SCD)");
+            t.Equals(ctrl & (1u << 14), 0u, "no error code (ECD)");
+            t.Equals(mem.readIORegister(0x10002030u), 0x000001B0u, "TOP should hold the start code");
+            t.Equals(mem.readIORegister(0x1000B000u) & 0x100u, 0u, "fromIPU should complete");
+            t.Equals(mem.readIORegister(0x1000B010u), 0x20400u, "fromIPU MADR should advance by one macroblock");
+            expectGreyMacroblock(t, rdram + 0x20000u, "the macroblock should be grey (130,130,130,0x80)");
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.IsTrue(std::find(causes.begin(), causes.end(), 3u) != causes.end(), "DMAC cause 3 should be queued");
+            t.IsTrue(std::find(causes.begin(), causes.end(), 4u) != causes.end(), "DMAC cause 4 should be queued");
+
+            mem.writeIORegister(0x10002000u, 0x40000000u); // FDEC: peek the next 32 bits
+            t.Equals(mem.readIORegister(0x10002000u), 0x000001B0u, "FDEC should return the start code");
+        });
+
+        tc.Run("IPU IDEC that runs out of input resumes on the next toIPU kick without repeating output", [=](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            uint8_t *rdram = mem.getRDRAM();
+            std::vector<uint8_t> first = ipuFlatMacroblock();
+            first.resize(16u, 0u); // zero stuffing: the start code is in the next quadword
+            uint8_t second[16] = {0x00, 0x00, 0x01, 0xB1};
+            std::memcpy(rdram + 0x10000u, first.data(), 16u);
+            std::memcpy(rdram + 0x10010u, second, 16u);
+
+            mem.writeIORegister(0x1000B010u, 0x20000u);
+            mem.writeIORegister(0x1000B020u, 65u); // one quadword more than IDEC produces
+            mem.writeIORegister(0x1000B000u, 0x100u);
+            mem.writeIORegister(0x1000B410u, 0x10000u);
+            mem.writeIORegister(0x1000B420u, 1u);
+            mem.writeIORegister(0x1000B400u, 0x101u);
+            mem.writeIORegister(0x10002010u, 0u);
+            mem.writeIORegister(0x10002000u, 0x10000000u);
+            t.Equals(mem.readIORegister(0x10002010u) & 0x80000000u, 0x80000000u, "IDEC should wait for input");
+            t.Equals(mem.readIORegister(0x1000B020u), 1u, "the macroblock should already be out");
+            expectGreyMacroblock(t, rdram + 0x20000u, "first macroblock should be grey");
+
+            mem.writeIORegister(0x1000B410u, 0x10010u);
+            mem.writeIORegister(0x1000B420u, 1u);
+            mem.writeIORegister(0x1000B400u, 0x101u);
+            t.Equals(mem.readIORegister(0x10002010u) & 0x80000000u, 0u, "IDEC should finish with the new input");
+            t.Equals(mem.readIORegister(0x10002030u), 0x000001B1u, "TOP should hold the end code");
+            t.Equals(mem.readIORegister(0x1000B020u), 1u, "resuming must not send the macroblock again");
+            t.Equals(mem.readIORegister(0x1000B000u) & 0x100u, 0x100u, "fromIPU should still wait for its last quadword");
+        });
+
+        tc.Run("IPU toIPU completes when a waiting command has used it all, even if it started > 10 qw back", [=](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            uint8_t *rdram = mem.getRDRAM();
+            std::vector<uint8_t> first = ipuFlatMacroblock();
+            first.resize(13u * 16u, 0u); // macroblock + 12 quadwords of zero stuffing
+            const uint8_t endCode[16] = {0x00, 0x00, 0x01, 0xB1};
+            std::memcpy(rdram + 0x10000u, first.data(), first.size());
+            std::memcpy(rdram + 0x10000u + first.size(), endCode, 16u);
+
+            mem.writeIORegister(0x1000B010u, 0x20000u);
+            mem.writeIORegister(0x1000B020u, 64u);
+            mem.writeIORegister(0x1000B000u, 0x100u);
+            mem.writeIORegister(0x10002010u, 0u);
+            mem.writeIORegister(0x10002000u, 0x10000000u); // IDEC before any input: waits
+            mem.writeIORegister(0x1000B410u, 0x10000u);
+            mem.writeIORegister(0x1000B420u, 13u);
+            mem.writeIORegister(0x1000B400u, 0x101u);
+            t.Equals(mem.readIORegister(0x10002010u) & 0x80000000u, 0x80000000u, "IDEC should wait for the end code");
+            t.Equals(mem.readIORegister(0x1000B400u) & 0x100u, 0u, "toIPU should complete: the IPU used all of it");
+            mem.writeIORegister(0x1000B410u, 0x10000u + 13u * 16u);
+            mem.writeIORegister(0x1000B420u, 1u);
+            mem.writeIORegister(0x1000B400u, 0x101u);
+            t.Equals(mem.readIORegister(0x10002010u) & 0x80000000u, 0u, "IDEC should finish");
+            t.Equals(mem.readIORegister(0x10002030u), 0x000001B1u, "TOP should hold the end code");
+            expectGreyMacroblock(t, rdram + 0x20000u, "the macroblock should be grey");
+        });
+
+        tc.Run("IPU toIPU stopped with STR clear keeps only what reached the FIFO", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.writeIORegister(0x1000B410u, 0x10000u);
+            mem.writeIORegister(0x1000B420u, 20u);
+            mem.writeIORegister(0x1000B400u, 0x101u);
+            t.Equals(mem.readIORegister(0x1000B400u) & 0x100u, 0x100u, "20 qw do not fit in the IPU: toIPU keeps running");
+            t.Equals(mem.readIORegister(0x1000B420u), 10u, "QWC should count what has not reached the IPU");
+            mem.writeIORegister(0x1000B400u, 0x001u); // stop
+            t.Equals(mem.readIORegister(0x1000B400u) & 0x100u, 0u, "STR should read clear");
+            t.Equals(mem.readIORegister(0x10002020u) >> 8, 0x208u, "FIFO full (8) + internal buffer (2) should remain");
+            mem.writeIORegister(0x10002010u, 0x40000000u); // reset empties them
+            t.Equals(mem.readIORegister(0x10002020u), 0u, "reset should leave nothing queued");
+        });
+
+        tc.Run("IPU FIFO writes, FDEC bit skips and BCLR", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            const uint8_t data[16] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 1, 2, 3, 4, 5, 6, 7, 8};
+            uint32_t words[4];
+            std::memcpy(words, data, sizeof(words));
+            for (uint32_t i = 0; i < 4u; ++i)
+                mem.write32(0x10007010u + 4u * i, words[i]);
+            t.Equals(mem.readIORegister(0x10002010u) & 0xFu, 0u, "one quadword sits in the internal buffer, not the FIFO");
+            mem.writeIORegister(0x10002000u, 0x40000000u);
+            t.Equals(mem.readIORegister(0x10002000u), 0x12345678u, "FDEC 0 should peek the first 32 bits, first byte on top");
+            mem.writeIORegister(0x10002000u, 0x40000004u);
+            t.Equals(mem.readIORegister(0x10002000u), 0x23456789u, "FDEC 4 should skip 4 bits first");
+            t.Equals(mem.readIORegister(0x10002020u) & 0x7Fu, 4u, "BP should be 4");
+            mem.writeIORegister(0x10002000u, 0x00000000u); // BCLR
+            t.Equals(mem.readIORegister(0x10002020u), 0u, "BCLR should empty the FIFO and reset BP");
+        });
+
+        tc.Run("VIF1 to memory (DIR 0 with VIF1_STAT.FDR) goes to the DMA hook, not the VIF1 interpreter", [](TestCase &t)
+        {
+            static int hookCalls = 0;
+            static uint32_t hookChannel = 0;
+            hookCalls = 0;
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            // The destination holds a STROW VIFcode: if it were interpreted, ROW would change.
+            uint8_t *rdram = mem.getRDRAM();
+            const uint32_t strow = 0x30000000u, rowValue = 0x1234u;
+            std::memcpy(rdram + 0x2000u, &strow, 4);
+            for (uint32_t i = 0; i < 4u; ++i)
+                std::memcpy(rdram + 0x2004u + 4u * i, &rowValue, 4);
+            setDmaKickHook([](PS2Memory &, uint32_t channel, uint32_t, uint32_t, uint32_t)
+                           {
+                               ++hookCalls;
+                               hookChannel = channel;
+                               return true;
+                           });
+            mem.writeIORegister(0x10003C00u, 1u << 23); // VIF1_STAT.FDR: VIF -> memory
+            mem.writeIORegister(0x10009010u, 0x2000u);
+            mem.writeIORegister(0x10009020u, 2u);
+            mem.writeIORegister(0x10009000u, 0x100u);
+            setDmaKickHook(nullptr);
+            t.Equals(hookCalls, 1, "the readback should reach the hook once");
+            t.Equals(hookChannel, 1u, "as channel 1");
+            t.Equals(mem.vif1_regs.row[0], 0u, "the destination must not be interpreted as VIFcodes");
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.IsTrue(causes.size() == 1u && causes[0] == 1u, "DMAC cause 1 should be queued");
+        });
+
         tc.Run("VIF DIRECT IMAGE data continues from the next DIRECT payload", [](TestCase &t)
         {
             PS2Memory mem;
@@ -1481,6 +1829,132 @@ void register_ps2_memory_tests()
                 }
             }
             t.IsTrue(ct32Ok, "all CT32 pixels should survive a preceding paletted upload in the same GIF DMA chain");
+        });
+
+        tc.Run("VIF1 DMA chain reads tags from scratchpad given as 0x80000000 | offset", [](TestCase &t)
+        {
+            // DMA addresses select the scratchpad with bit 31 (SCE libraries pass 0x80000000 |
+            // offset). This Is Football sends its VU1 init packet (EOP GIFtag at VU1 qw0) this way.
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            uint8_t *spr = mem.getScratchpad();
+            std::memset(spr, 0, 0x40u);
+            const uint64_t cntTag = 2ull | (1ull << 28);  // cnt, 2 qwords follow
+            const uint64_t endTag = 0ull | (7ull << 28);  // end, no data
+            std::memcpy(spr + 0x00u, &cntTag, sizeof(cntTag));
+            const uint32_t words[8] = {0u, makeVifCmd(0x6Cu, 1u, 0u), 0x8000u, 0u, 0u, 0u, 0u, 0u};
+            std::memcpy(spr + 0x10u, words, sizeof(words));
+            std::memcpy(spr + 0x30u, &endTag, sizeof(endTag));
+            std::memset(mem.getVU1Data(), 0, 16u);
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, 0x80000000u), "write VIF1 TADR (scratchpad 0) should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x20u, 0u), "write VIF1 QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u), "write VIF1 CHCR (chain, STR) should succeed");
+            mem.processPendingTransfers();
+
+            uint32_t qw0[4] = {};
+            std::memcpy(qw0, mem.getVU1Data(), sizeof(qw0));
+            t.Equals(qw0[0], 0x8000u, "the UNPACK from the scratchpad chain should write VU1 qw0");
+        });
+
+        tc.Run("fromSPR DMA can target VU0 data memory (MADR 0x11004000)", [](TestCase &t)
+        {
+            // This Is Football builds its animated bone palette in scratchpad and sends it to VU0
+            // data memory with fromSPR; the transfer used to be dropped (MADR is not RAM).
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kFromSpr = 0x1000D000u;
+            uint8_t *spr = mem.getScratchpad();
+            for (uint32_t i = 0; i < 32u; ++i)
+                spr[0x100u + i] = static_cast<uint8_t>(0xA0u + i);
+            std::memset(mem.getVU0Data(), 0, 0x60u);
+
+            t.IsTrue(mem.writeIORegister(kFromSpr + 0x10u, PS2_VU0_DATA_BASE + 0x20u), "write fromSPR MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kFromSpr + 0x80u, 0x100u), "write fromSPR SADR should succeed");
+            t.IsTrue(mem.writeIORegister(kFromSpr + 0x20u, 2u), "write fromSPR QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kFromSpr + 0x00u, 0x100u), "write fromSPR CHCR (STR) should succeed");
+
+            t.IsTrue(std::memcmp(mem.getVU0Data() + 0x20u, spr + 0x100u, 32u) == 0, "VU0 data qw 2-3 should hold the scratchpad bytes");
+            t.Equals(mem.getVU0Data()[0x1Fu], static_cast<uint8_t>(0u), "bytes before the destination stay untouched");
+            t.Equals(mem.read32(kFromSpr + 0x00u) & 0x100u, 0u, "STR should clear when the transfer completes");
+            t.Equals(mem.read32(kFromSpr + 0x10u), PS2_VU0_DATA_BASE + 0x40u, "MADR should advance past the transfer");
+
+            // toSPR reads VU memory the same way.
+            constexpr uint32_t kToSpr = 0x1000D400u;
+            std::memset(spr + 0x200u, 0, 32u);
+            t.IsTrue(mem.writeIORegister(kToSpr + 0x10u, PS2_VU0_DATA_BASE + 0x20u), "write toSPR MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kToSpr + 0x80u, 0x200u), "write toSPR SADR should succeed");
+            t.IsTrue(mem.writeIORegister(kToSpr + 0x20u, 2u), "write toSPR QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kToSpr + 0x00u, 0x101u), "write toSPR CHCR (STR) should succeed");
+            t.IsTrue(std::memcmp(spr + 0x200u, spr + 0x100u, 32u) == 0, "toSPR from VU0 data should copy the bytes back");
+        });
+
+        tc.Run("VIF0 UNPACK header from the FIFO takes its data from the next DMA", [](TestCase &t)
+        {
+            // This Is Football (0x2B2340) writes STCYCL + UNPACK to the VIF0 FIFO with SQ, then
+            // sends the UNPACK data with a normal-mode VIF0 DMA. VIF0 must keep the pending UNPACK.
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU0Data(), 0, 0x80u);
+
+            const __m128i header = _mm_setr_epi32(0, 0, static_cast<int>(makeVifCmd(0x01u, 0u, 0x0101u)),
+                                                  static_cast<int>(makeVifCmd(0x6Cu, 2u, 3u)));
+            mem.write128(0x10004000u, header);
+
+            constexpr uint32_t kSrc = 0x00030000u;
+            const uint32_t payload[8] = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
+            std::memcpy(mem.getRDRAM() + kSrc, payload, sizeof(payload));
+            constexpr uint32_t kVif0Ch = 0x10008000u;
+            t.IsTrue(mem.writeIORegister(kVif0Ch + 0x10u, kSrc), "write VIF0 MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif0Ch + 0x20u, 2u), "write VIF0 QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kVif0Ch + 0x00u, 0x101u), "write VIF0 CHCR (normal, STR) should succeed");
+            mem.processPendingTransfers();
+
+            t.IsTrue(std::memcmp(mem.getVU0Data() + 3u * 16u, payload, sizeof(payload)) == 0,
+                     "the DMA data should land at VU0 qw 3-4 through the FIFO's UNPACK");
+
+            // The interpreter is back at a VIFcode boundary: a following packet decodes normally,
+            // here an S-16 (sign extended, broadcast) whose address 0x100 wraps to VU0 qw 0.
+            const __m128i s16 = _mm_setr_epi32(static_cast<int>(makeVifCmd(0x61u, 1u, 0x100u)), 0x0000FFFE, 0, 0);
+            mem.write128(0x10004000u, s16);
+            uint32_t qw0[4] = {};
+            std::memcpy(qw0, mem.getVU0Data(), sizeof(qw0));
+            t.Equals(qw0[0], 0xFFFFFFFEu, "S-16 should sign-extend into x");
+            t.Equals(qw0[3], 0xFFFFFFFEu, "S-16 should broadcast to w");
+        });
+
+        tc.Run("VIF0 MSCAL starts the VU0 handler and the packet goes on", [](TestCase &t)
+        {
+            // This Is Football's match sends ITOP + UNPACK + MSCAL 0x100 + FLUSHE (i bit) via VIF0.
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU0Data(), 0, 0x40u);
+
+            uint32_t calls = 0u, gotPc = 0u, gotItop = 0u;
+            setVif0MscalHandler([&](uint32_t startPC, uint32_t itop)
+                                {
+                                    ++calls;
+                                    gotPc = startPC;
+                                    gotItop = itop;
+                                });
+            const __m128i first = _mm_setr_epi32(static_cast<int>(makeVifCmd(0x04u, 0u, 0x7Eu)),  // ITOP 0x7E
+                                                 static_cast<int>(makeVifCmd(0x14u, 0u, 0x100u)), // MSCAL 0x100
+                                                 static_cast<int>(0x90000000u),                  // FLUSHE, i bit
+                                                 static_cast<int>(makeVifCmd(0x6Cu, 1u, 2u)));    // UNPACK V4-32 -> qw2
+            mem.write128(0x10004000u, first);
+            mem.write128(0x10004000u, _mm_setr_epi32(11, 12, 13, 14));
+            setVif0MscalHandler(nullptr);
+
+            t.Equals(calls, 1u, "MSCAL should call the VU0 handler once");
+            t.Equals(gotPc, 0x800u, "MSCAL 0x100 should start at byte 0x800");
+            t.Equals(gotItop, 0x7Eu, "the handler should get VIF0 ITOPS");
+            uint32_t qw2[4] = {};
+            std::memcpy(qw2, mem.getVU0Data() + 0x20u, sizeof(qw2));
+            t.Equals(qw2[0], 11u, "codes after MSCAL should still run (the UNPACK's data from the next FIFO write)");
+            t.Equals(qw2[3], 14u, "the whole UNPACK vector should land");
         });
 
         tc.Run("VIF1 DMA DIRECT forwards payload to GIF callback and clears channel", [](TestCase &t)

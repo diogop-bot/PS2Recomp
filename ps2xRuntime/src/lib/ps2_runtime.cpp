@@ -14,6 +14,7 @@
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 #include "runtime/ps2_host_hooks.h"
+#include "runtime/ps2_vif0_mscal.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -21,6 +22,10 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -88,6 +93,19 @@ struct ProgramHeader
 
 namespace
 {
+    // VU1 cycles one MSCAL/MSCNT may run before the interpreter returns (the rest of that program
+    // is lost). PS2X_VU1_BUDGET=<cycles> overrides the default.
+    uint32_t vu1CycleBudget()
+    {
+        static const uint32_t budget = []
+        {
+            const char *env = std::getenv("PS2X_VU1_BUDGET");
+            const unsigned long v = env ? std::strtoul(env, nullptr, 0) : 0ul;
+            return v ? static_cast<uint32_t>(v) : 65536u;
+        }();
+        return budget;
+    }
+
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
@@ -506,6 +524,7 @@ PS2Runtime::PS2Runtime()
     m_guestHeapConfigured = false;
     m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackReserved = false;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -687,7 +706,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                                   m_gs, &m_memory, startPC, top, itop, vu1CycleBudget());
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -705,11 +724,28 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
+                                                  m_gs, &m_memory, top, itop, vu1CycleBudget());
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    // VIF0 MSCAL/MSCALF: run the VU0 microprogram now, on the current EE context's VU0 registers.
+    setVif0MscalHandler([this](uint32_t startPC, uint32_t itop)
+                        {
+                            R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                            if (!cpuContext)
+                                cpuContext = &m_cpuContext;
+                            // PS2X_VIF0_MSCAL=0 ignores VIF0 MSCAL (diagnostics: TIF then stops
+                            // presenting frames after match load, as it waits on the results).
+                            static const bool enabled = []
+                            {
+                                const char *e = std::getenv("PS2X_VIF0_MSCAL");
+                                return !(e && e[0] == '0');
+                            }();
+                            if (!enabled)
+                                return;
+                            cpuContext->vu0_itop = itop;
+                            executeVU0Microprogram(nullptr, cpuContext, startPC); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -980,6 +1016,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
         m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
         m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackReserved = false;
     }
 
     LoadedModule module;
@@ -1473,11 +1510,101 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
 
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
+
+    // PS2X_VU0_DUMP=<file>[,<pc>]: before the first VCALLMS/VCALLMSR (to that pc), write VU0 code
+    // (<file>.vucode), data (<file>.vumem) and the VF/VI registers (<file>.regs).
+    static const std::pair<std::string, long> vu0Dump = []
+    {
+        const char *e = std::getenv("PS2X_VU0_DUMP");
+        if (!e || !*e)
+            return std::pair<std::string, long>{std::string(), -1};
+        std::string s(e);
+        long pc = -1;
+        const size_t comma = s.rfind(',');
+        if (comma != std::string::npos)
+        {
+            pc = std::strtol(s.c_str() + comma + 1, nullptr, 0);
+            s.resize(comma);
+        }
+        return std::pair<std::string, long>{s, pc};
+    }();
+    static bool vu0Dumped = false;
+    static long vu0DumpSkip = []
+    {
+        const char *e = std::getenv("PS2X_VU0_DUMP_SKIP");
+        return e && *e ? std::strtol(e, nullptr, 0) : 0L;
+    }();
+    if (!vu0Dump.first.empty() && !vu0Dumped && (vu0Dump.second < 0 || static_cast<uint32_t>(vu0Dump.second) == startPC) &&
+        vu0DumpSkip-- <= 0)
+    {
+        vu0Dumped = true;
+        if (FILE *f = std::fopen((vu0Dump.first + ".vucode").c_str(), "wb"))
+        {
+            std::fwrite(vu0Code, 1, PS2_VU0_CODE_SIZE, f);
+            std::fclose(f);
+        }
+        if (FILE *f = std::fopen((vu0Dump.first + ".vumem").c_str(), "wb"))
+        {
+            std::fwrite(vu0Data, 1, PS2_VU0_DATA_SIZE, f);
+            std::fclose(f);
+        }
+        if (FILE *f = std::fopen((vu0Dump.first + ".regs").c_str(), "w"))
+        {
+            std::fprintf(f, "start=0x%X cmsar0=0x%X\n", startPC, ctx->vu0_cmsar0);
+            for (int r = 0; r < 32; ++r)
+            {
+                uint32_t w[4];
+                std::memcpy(w, m_vu0.state().vf[r], sizeof(w));
+                std::fprintf(f, "vf%02d %08X %08X %08X %08X\n", r, w[0], w[1], w[2], w[3]);
+            }
+            {
+                uint32_t a[4], iv = 0, qv = 0;
+                std::memcpy(a, m_vu0.state().acc, sizeof(a));
+                std::memcpy(&iv, &m_vu0.state().i, 4);
+                std::memcpy(&qv, &m_vu0.state().q, 4);
+                std::fprintf(f, "acc %08X %08X %08X %08X i %08X q %08X\n", a[0], a[1], a[2], a[3], iv, qv);
+            }
+            for (int r = 0; r < 16; ++r)
+                std::fprintf(f, "vi%02d 0x%X\n", r, static_cast<unsigned>(m_vu0.state().vi[r]) & 0xFFFFu);
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "[vu0] dumped VU0 state to %s.* (start 0x%X)\n", vu0Dump.first.c_str(), startPC);
+    }
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
                   m_gs, &m_memory,
                   startPC, 0u, ctx->vu0_itop, 4096);
     copyVu0StateToContext(m_vu0.state(), ctx);
+
+    // PS2X_VU0_WATCH=<pc>,<byte address>: tally the 32-bit VU0 data word at that address after each
+    // VCALLMS to that pc (a result the EE reads back), printed every 2000 calls.
+    static const std::pair<long, long> vu0Watch = []
+    {
+        const char *e = std::getenv("PS2X_VU0_WATCH");
+        if (!e || !*e)
+            return std::pair<long, long>{-1, -1};
+        char *end = nullptr;
+        const long pc = std::strtol(e, &end, 0);
+        const long addr = (end && *end == ',') ? std::strtol(end + 1, nullptr, 0) : -1;
+        return std::pair<long, long>{pc, addr};
+    }();
+    if (vu0Watch.first >= 0 && static_cast<uint32_t>(vu0Watch.first) == startPC && vu0Watch.second >= 0 &&
+        static_cast<uint32_t>(vu0Watch.second) + 4u <= PS2_VU0_DATA_SIZE)
+    {
+        static std::map<uint32_t, uint64_t> tally;
+        static uint64_t calls = 0;
+        uint32_t word = 0;
+        std::memcpy(&word, vu0Data + vu0Watch.second, sizeof(word));
+        ++tally[word];
+        if (++calls % 2000u == 0u)
+        {
+            std::fprintf(stderr, "[vu0:watch] pc=0x%lX [0x%lX] after %llu calls:", vu0Watch.first, vu0Watch.second,
+                         static_cast<unsigned long long>(calls));
+            for (const auto &kv : tally)
+                std::fprintf(stderr, " 0x%X=%llu", kv.first, static_cast<unsigned long long>(kv.second));
+            std::fprintf(stderr, "%c", 10);
+        }
+    }
 }
 
 void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
@@ -2044,7 +2171,36 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     }
 
     m_asyncCallbackStackTop = base;
+    m_asyncCallbackStackReserved = true;
     return top - 0x10u;
+}
+
+bool PS2Runtime::setAsyncCallbackStackRange(uint32_t floor, uint32_t top)
+{
+    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    floor = alignGuestHeapValue(floor, kGuestHeapDefaultAlignment);
+    top &= ~(kGuestHeapDefaultAlignment - 1u);
+    if (floor == 0u || top <= floor || top > PS2_RAM_SIZE)
+    {
+        return false;
+    }
+    if (m_asyncCallbackStackReserved)
+    {
+        return false; // a stack was handed out already and would stay in the old region
+    }
+    m_asyncCallbackStackFloor = floor;
+    m_asyncCallbackStackTop = top;
+    return true;
+}
+
+void PS2Runtime::limitAsyncCallbackStacks(uint32_t ceiling)
+{
+    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    ceiling &= ~(kGuestHeapDefaultAlignment - 1u);
+    if (ceiling > m_asyncCallbackStackFloor && ceiling < m_asyncCallbackStackTop)
+    {
+        m_asyncCallbackStackTop = ceiling;
+    }
 }
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)

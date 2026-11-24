@@ -310,6 +310,41 @@ void register_code_generator_tests()
         }
     });
 
+    tc.Run("R5900 MMI HI/LO moves use all 128 bits and PMFHL.LH does not saturate", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        Instruction pmthi{};
+        pmthi.opcode = OPCODE_MMI;
+        pmthi.isMMI = true;
+        pmthi.function = MMI_MMI3;
+        pmthi.sa = MMI3_PMTHI;
+        pmthi.rs = 10;
+        const std::string toHi = gen.translateInstruction(pmthi);
+        t.IsTrue(toHi.find("ctx->hi1") != std::string::npos && toHi.find("GPR_VEC(ctx, 10)") != std::string::npos,
+                 "PMTHI should write both halves of HI from rs but got: " + toHi);
+
+        pmthi.sa = MMI3_PMTLO;
+        const std::string toLo = gen.translateInstruction(pmthi);
+        t.IsTrue(toLo.find("ctx->lo1") != std::string::npos, "PMTLO should write both halves of LO but got: " + toLo);
+
+        Instruction pmfhl{};
+        pmfhl.opcode = OPCODE_MMI;
+        pmfhl.isMMI = true;
+        pmfhl.function = MMI_PMFHL;
+        pmfhl.sa = PMFHL_LH;
+        pmfhl.rd = 2;
+        const std::string lh = gen.translateInstruction(pmfhl);
+        t.IsTrue(lh.find("ctx->lo1") != std::string::npos && lh.find("ctx->hi1") != std::string::npos,
+                 "PMFHL.LH should read the upper halves of HI/LO but got: " + lh);
+        t.IsTrue(lh.find("_mm_packus_epi32") != std::string::npos && lh.find("0xFFFF") != std::string::npos &&
+                     lh.find("_mm_packs_epi32") == std::string::npos,
+                 "PMFHL.LH should truncate each word to its low halfword, not saturate, but got: " + lh);
+
+        pmfhl.sa = PMFHL_SH;
+        const std::string sh = gen.translateInstruction(pmfhl);
+        t.IsTrue(sh.find("_mm_packs_epi32") != std::string::npos, "PMFHL.SH should saturate but got: " + sh);
+    });
+
     tc.Run("R5900 MMI MULT1 writes rd when rd is non-zero", [](TestCase &t) {
         CodeGenerator gen({}, {});
 
@@ -1412,6 +1447,59 @@ void register_code_generator_tests()
             const std::string madda = gen.translateVU_VMADDA(inst);
             t.IsTrue(madda.find("ctx->vu0_acc =") != std::string::npos,
                      "MADDA must continue writing ACC");
+        });
+
+        tc.Run("VU0 macro VSQD/VSQI/VLQI/VLQD/VISWR/VILWR address VU0 data memory with the right fields", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            // vsqd.xyzw $vf0, (--$vi14) = 0x4BEE037F (This Is Football 2005): it = 14 (rt), fs = 0 (rd).
+            Instruction sqd{};
+            sqd.raw = 0x4BEE037Fu;
+            sqd.rt = 14;
+            sqd.rd = 0;
+            sqd.vectorInfo.vectorField = 0xF;
+            const std::string a = gen.translateVU_VSQD(sqd);
+            t.IsTrue(a.find("ctx->vi[14] = static_cast<uint16_t>(ctx->vi[14] - 1u)") != std::string::npos, "VSQD pre-decrements vi14");
+            t.IsTrue(a.find("ctx->vu0_vf[0]") != std::string::npos, "VSQD stores fs (vf0)");
+            t.IsTrue(a.find("0x11004000u") != std::string::npos, "VSQD writes VU0 data memory");
+            t.IsTrue(a.find("ctx->vi[0] =") == std::string::npos, "vi0 is never written");
+
+            Instruction lqi{};
+            lqi.rt = 3;  // ft
+            lqi.rd = 14; // is
+            lqi.vectorInfo.vectorField = 0x8;
+            const std::string b = gen.translateVU_VLQI(lqi);
+            t.IsTrue(b.find("ctx->vu0_vf[3]") != std::string::npos && b.find("ctx->vi[14] = static_cast<uint16_t>(ctx->vi[14] + 1u)") != std::string::npos,
+                     "VLQI loads ft and post-increments is");
+            t.IsTrue(b.find("_mm_set_epi32(0, 0, 0, -1)") != std::string::npos, "dest x selects lane 0 only");
+
+            Instruction iswr{};
+            iswr.rt = 2; // value
+            iswr.rd = 5; // address
+            iswr.vectorInfo.vectorField = 0x4 | 0x1; // y and w
+            const std::string c = gen.translateVU_VISWR(iswr);
+            t.IsTrue(c.find("WRITE32(addr + 4u, v)") != std::string::npos && c.find("WRITE32(addr + 12u, v)") != std::string::npos &&
+                         c.find("WRITE32(addr + 0u, v)") == std::string::npos,
+                     "VISWR writes the selected fields of VU0 data[vi5]");
+
+            Instruction ilwr{};
+            ilwr.rt = 2;
+            ilwr.rd = 5;
+            ilwr.vectorInfo.vectorField = 0x2; // z
+            const std::string d = gen.translateVU_VILWR(ilwr);
+            t.IsTrue(d.find("+ 8u") != std::string::npos && d.find("ctx->vi[2] =") != std::string::npos, "VILWR.z reads field z into vi2");
+        });
+
+        tc.Run("VU0 VCALLMSR starts at CMSAR0, not a VI register", [](TestCase &t) {
+            // vcallmsr $vi27 (0x4A00D839): the register field is 27 = CMSAR0. Indexing ctx->vi[27]
+            // read past the 16-entry VI array (This Is Football 2005 culled almost everything).
+            Instruction inst{};
+            inst.raw = 0x4A00D839u;
+            inst.rd = 27;
+            CodeGenerator gen({}, {});
+            const std::string code = gen.translateVU_VCALLMSR(inst);
+            t.IsTrue(code.find("ctx->vu0_cmsar0") != std::string::npos, "VCALLMSR must read CMSAR0");
+            t.IsTrue(code.find("ctx->vi[") == std::string::npos, "VCALLMSR must not index the VI array");
+            t.IsTrue(code.find("<< 3") != std::string::npos, "CMSAR0 is an instruction index (x8 bytes)");
         });
 
         tc.Run("VU0 OPMULA and OPMSUB use cross-product lane permutations", [](TestCase &t) {

@@ -1,14 +1,21 @@
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_dma_hook.h"
 #include "runtime/ps2_address.h"
+#include "runtime/ps2_ipu.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <limits>
+#include <unordered_map>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
@@ -347,6 +354,47 @@ struct PS2Memory::GsWorker
     TransferBufferPool pool;
 };
 
+namespace
+{
+    // IPU (runtime/ps2_ipu.h) and its DMA state, one per PS2Memory; kept here so ps2_memory.h does
+    // not change. ch3 = fromIPU (output to memory), ch4 = toIPU (bitstream from memory).
+    struct IpuGlue
+    {
+        std::recursive_mutex mutex;
+        Ps2Ipu ipu;
+        bool ch3Active = false;
+        bool ch4Active = false;
+        uint32_t ch4End = 0u; // MADR after the last toIPU kick
+        uint32_t ch4Qwc = 0u; // QWC of that kick
+        uint32_t outFifo[4] = {};
+    };
+
+    std::mutex s_ipuGlueMapMutex;
+    std::unordered_map<const PS2Memory *, std::unique_ptr<IpuGlue>> s_ipuGlue;
+
+    IpuGlue &ipuGlueFor(const PS2Memory *mem)
+    {
+        std::lock_guard<std::mutex> lock(s_ipuGlueMapMutex);
+        std::unique_ptr<IpuGlue> &glue = s_ipuGlue[mem];
+        if (!glue)
+            glue = std::make_unique<IpuGlue>();
+        return *glue;
+    }
+
+    void dropIpuGlue(const PS2Memory *mem)
+    {
+        std::lock_guard<std::mutex> lock(s_ipuGlueMapMutex);
+        s_ipuGlue.erase(mem);
+    }
+
+    // PS2X_IPU_LOG=1: one line per IPU command / DMA kick.
+    bool ipuLogEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_IPU_LOG") != nullptr;
+        return enabled;
+    }
+}
+
 PS2Memory::PS2Memory()
     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
 {
@@ -355,6 +403,7 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    dropIpuGlue(this);
     setGsWorker(false);
     if (m_rdram)
     {
@@ -427,6 +476,7 @@ bool PS2Memory::initialize(size_t ramSize)
     };
 
     cleanup();
+    dropIpuGlue(this);
     m_seenGifCopy = false;
     m_dmaStartCount.store(0, std::memory_order_relaxed);
     m_gifCopyCount.store(0, std::memory_order_relaxed);
@@ -634,6 +684,42 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
     }
     return nearest;
+}
+
+namespace
+{
+    // DMA addresses (Dn_MADR, Dn_TADR, DMAtag ADDR) select the scratchpad with bit 31 and give the
+    // scratchpad offset in the low 14 bits (SCE libraries pass 0x80000000 | offset). The rest of
+    // the runtime spells scratchpad as 0x70000000 + offset, so translate that form. Other values
+    // are returned unchanged (a KSEG0 RAM pointer has bit 31 set too, but never an offset < 16 KB).
+    uint32_t dmaGuestAddress(uint32_t addr)
+    {
+        if ((addr & 0x80000000u) != 0u && (addr & 0x7FFFFFFFu) < PS2_SCRATCHPAD_SIZE)
+            return PS2_SCRATCHPAD_BASE | (addr & (PS2_SCRATCHPAD_SIZE - 1u));
+        return addr;
+    }
+}
+
+namespace
+{
+    // PS2X_VU0_DATA_WATCH=<byte address>: EE writes to that VU0 data quadword, with its value after
+    // the write (first 200). VU0 micro stores are logged by the VU core (same variable).
+    void watchVu0DataWrite(uint32_t offset, const uint8_t *vuMem)
+    {
+        static const long watch = []
+        {
+            const char *e = std::getenv("PS2X_VU0_DATA_WATCH");
+            return e && *e ? std::strtol(e, nullptr, 0) : -1L;
+        }();
+        if (watch < 0 || (offset & ~15u) != (static_cast<uint32_t>(watch) & ~15u))
+            return;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) >= 200)
+            return;
+        uint32_t w[4];
+        std::memcpy(w, vuMem + (offset & ~15u), sizeof(w));
+        std::fprintf(stderr, "[ee:vu0data] write at 0x%X -> %08X %08X %08X %08X%c", offset, w[0], w[1], w[2], w[3], 10);
+    }
 }
 
 bool PS2Memory::isScratchpad(uint32_t address) const
@@ -1003,6 +1089,10 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
         {
             (void)vuLimit;
             vuMem[vuOffset] = value;
+            if (vuMem == m_vu1Data && vuOffset < 0x50u && std::getenv("PS2X_VU1_STORE_WATCH"))
+                std::fprintf(stderr, "[ee:vu1data] write at 0x%X%c", vuOffset, 10);
+            if (vuMem == m_vu0Data)
+                watchVu0DataWrite(vuOffset, vuMem);
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1046,6 +1136,10 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
         {
             storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
+            if (vuMem == m_vu1Data && vuOffset < 0x50u && std::getenv("PS2X_VU1_STORE_WATCH"))
+                std::fprintf(stderr, "[ee:vu1data] write at 0x%X%c", vuOffset, 10);
+            if (vuMem == m_vu0Data)
+                watchVu0DataWrite(vuOffset, vuMem);
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1111,6 +1205,10 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
         {
             storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
+            if (vuMem == m_vu1Data && vuOffset < 0x50u && std::getenv("PS2X_VU1_STORE_WATCH"))
+                std::fprintf(stderr, "[ee:vu1data] write at 0x%X%c", vuOffset, 10);
+            if (vuMem == m_vu0Data)
+                watchVu0DataWrite(vuOffset, vuMem);
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1167,6 +1265,10 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
         {
             storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
+            if (vuMem == m_vu1Data && vuOffset < 0x50u && std::getenv("PS2X_VU1_STORE_WATCH"))
+                std::fprintf(stderr, "[ee:vu1data] write at 0x%X%c", vuOffset, 10);
+            if (vuMem == m_vu0Data)
+                watchVu0DataWrite(vuOffset, vuMem);
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1225,6 +1327,10 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         {
             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
+            if (vuMem == m_vu1Data && vuOffset < 0x50u && std::getenv("PS2X_VU1_STORE_WATCH"))
+                std::fprintf(stderr, "[ee:vu1data] write at 0x%X%c", vuOffset, 10);
+            if (vuMem == m_vu0Data)
+                watchVu0DataWrite(vuOffset, vuMem);
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
@@ -1243,10 +1349,73 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
 }
 
+namespace
+{
+    std::atomic<DmaKickHook> s_dmaKickHook{nullptr};
+}
+
+void setDmaKickHook(DmaKickHook hook)
+{
+    s_dmaKickHook.store(hook, std::memory_order_release);
+}
+
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
     if (address >= 0x10003000u && address < 0x10007000u)
         syncGsWorker("gif/vif registers");
+
+    // IPU: hands queued output to a running fromIPU (ch3) transfer and completes ch3 once its QWC is
+    // filled, and ch4 once the IPU holds everything it was given (FIFO + internal buffer: 10 qw).
+    const auto serviceIpu = [this](IpuGlue &g)
+    {
+        if (g.ch3Active)
+        {
+            uint32_t madr = m_ioRegisters[0x1000B010u];
+            uint32_t qwc = m_ioRegisters[0x1000B020u] & 0xFFFFu;
+            while (qwc != 0u && g.ipu.queuedOutputBytes() >= 16u)
+            {
+                uint8_t *dst = nullptr;
+                uint32_t roomQw = 0u;
+                if (madr & 0x80000000u)
+                {
+                    const uint32_t off = madr & (PS2_SCRATCHPAD_SIZE - 1u) & ~15u;
+                    dst = m_scratchpad + off;
+                    roomQw = (PS2_SCRATCHPAD_SIZE - off) / 16u;
+                }
+                else
+                {
+                    const uint32_t off = madr & (PS2_RAM_SIZE - 1u) & ~15u;
+                    dst = m_rdram + off;
+                    roomQw = (PS2_RAM_SIZE - off) / 16u;
+                }
+                const size_t got = g.ipu.takeOutput(dst, static_cast<size_t>(std::min(qwc, roomQw)) * 16u) / 16u;
+                if (got == 0u)
+                    break;
+                madr += static_cast<uint32_t>(got) * 16u;
+                qwc -= static_cast<uint32_t>(got);
+            }
+            m_ioRegisters[0x1000B010u] = madr;
+            m_ioRegisters[0x1000B020u] = qwc;
+            if (qwc == 0u)
+            {
+                g.ch3Active = false;
+                completeDmacChannel(0x1000B000u, 3u);
+            }
+        }
+        if (g.ch4Active)
+        {
+            const uint32_t queued = g.ipu.queuedInputQwords();
+            const uint32_t inDma = std::min(g.ch4Qwc, queued > 10u ? queued - 10u : 0u);
+            m_ioRegisters[0x1000B420u] = inDma;
+            m_ioRegisters[0x1000B410u] = g.ch4End - inDma * 16u;
+            if (inDma == 0u)
+            {
+                g.ch4Active = false;
+                completeDmacChannel(0x1000B400u, 4u);
+            }
+        }
+    };
+
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1303,22 +1472,30 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
-    if (address >= 0x10002000 && address <= 0x10002030)
+    if (address >= 0x10002000u && address < 0x10002040u)
     {
-        if (address == 0x10002010)
-        {
-            m_ioRegisters[address] = value & ~(1u << 31);
-            if (value & (1u << 30))
-            {
-                m_ioRegisters[0x10002000] = 0;
-                m_ioRegisters[0x10002020] = 0;
-                m_ioRegisters[0x10002030] = 0;
-            }
-        }
-        else
-        {
-            m_ioRegisters[address] = value;
-        }
+        IpuGlue &g = ipuGlueFor(this);
+        std::lock_guard<std::recursive_mutex> lock(g.mutex);
+        if (address == 0x10002000u)
+            g.ipu.writeCmd(value);
+        else if (address == 0x10002010u)
+            g.ipu.writeCtrl(value);
+        m_ioRegisters[address] = value;
+        serviceIpu(g);
+        if (ipuLogEnabled() && (address == 0x10002000u || address == 0x10002010u))
+            std::fprintf(stderr, "[ipu] %s=0x%08X -> busy=%d ctrl=0x%08X top=0x%08X in=%uqw out=0x%zX ch3=%d ch4=%d\n",
+                         address == 0x10002000u ? "CMD" : "CTRL", value, g.ipu.busy() ? 1 : 0, g.ipu.readCtrl(),
+                         g.ipu.readTop(), g.ipu.queuedInputQwords(), g.ipu.queuedOutputBytes(), g.ch3Active ? 1 : 0,
+                         g.ch4Active ? 1 : 0);
+        return true;
+    }
+
+    if (address >= 0x10007010u && address < 0x10007020u) // IPU_in_FIFO (32-bit pieces)
+    {
+        IpuGlue &g = ipuGlueFor(this);
+        std::lock_guard<std::recursive_mutex> lock(g.mutex);
+        g.ipu.writeInFifoWord((address - 0x10007010u) / 4u, value);
+        serviceIpu(g);
         return true;
     }
 
@@ -1420,6 +1597,23 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10008000 && address < 0x1000F000)
     {
+        // IPU DMA stopped (CHCR written with STR clear, e.g. sceIpuStopDMA): toIPU data that had not
+        // reached the FIFO stays in memory (MADR/QWC say where), fromIPU stops taking output.
+        if ((address == 0x1000B000u || address == 0x1000B400u) && (value & 0x100u) == 0u)
+        {
+            IpuGlue &g = ipuGlueFor(this);
+            std::lock_guard<std::recursive_mutex> lock(g.mutex);
+            if (address == 0x1000B400u && g.ch4Active)
+            {
+                g.ipu.dropInputBeyond(10u);
+                g.ch4Active = false;
+            }
+            if (address == 0x1000B000u)
+                g.ch3Active = false;
+            m_ioRegisters[address] = value;
+            return true;
+        }
+
         if ((address & 0xFF) == 0x00 && (value & 0x100))
         {
             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
@@ -1436,6 +1630,85 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
+                return true;
+            }
+
+            const auto completeAtOnce = [&](uint32_t channel)
+            {
+                constexpr uint32_t D_STAT = 0x1000E010u;
+                m_ioRegisters[channelBase + 0x10] = madr + qwc * 16u;
+                m_ioRegisters[channelBase + 0x20] = 0u;
+                m_ioRegisters[channelBase + 0x00] = value & ~0x100u;
+                uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
+                dstat |= (1u << channel);
+                if (((dstat & 0x3FFu) & ((dstat >> 16) & 0x3FFu)) != 0u)
+                    dstat |= (1u << 31);
+                else
+                    dstat &= ~(1u << 31);
+                m_ioRegisters[D_STAT] = dstat;
+                queueCompletedDmacCause(channel);
+            };
+
+            // IPU channels (3 fromIPU, 4 toIPU): not emulated. A game hook can complete the kick
+            // (see runtime/ps2_dma_hook.h); otherwise they feed the IPU (runtime/ps2_ipu.h).
+            if (channelBase == 0x1000B000u || channelBase == 0x1000B400u)
+            {
+                const DmaKickHook hook = s_dmaKickHook.load(std::memory_order_acquire);
+                const uint32_t channel = (channelBase == 0x1000B000u) ? 3u : 4u;
+                if (hook && hook(*this, channel, madr, qwc, value))
+                {
+                    completeAtOnce(channel);
+                    return true;
+                }
+
+                IpuGlue &g = ipuGlueFor(this);
+                std::lock_guard<std::recursive_mutex> lock(g.mutex);
+                m_ioRegisters[address] = value; // STR stays set until serviceIpu completes it
+                if (channel == 4u)
+                {
+                    if (g.ch4Active) // a running transfer is replaced: what it had not sent is gone
+                        g.ipu.dropInputBeyond(10u);
+                    if (((value >> 2) & 0x3u) != 0u)
+                    {
+                        static std::atomic<int> warned{0};
+                        if (warned.fetch_add(1) < 4)
+                            std::fprintf(stderr, "[ipu] toIPU CHCR 0x%08X: chain mode is not supported, sending MADR/QWC only\n", value);
+                    }
+                    const bool fromSpr = (madr & 0x80000000u) != 0u;
+                    const uint32_t off = fromSpr ? (madr & (PS2_SCRATCHPAD_SIZE - 1u) & ~15u) : (madr & (PS2_RAM_SIZE - 1u) & ~15u);
+                    const uint32_t limitQw = ((fromSpr ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE) - off) / 16u;
+                    const uint32_t sendQw = std::min(qwc & 0xFFFFu, limitQw);
+                    g.ch4Active = true;
+                    g.ch4Qwc = sendQw;
+                    g.ch4End = madr + sendQw * 16u;
+                    g.ipu.pushInput((fromSpr ? m_scratchpad : m_rdram) + off, sendQw);
+                }
+                else
+                {
+                    g.ch3Active = true;
+                }
+                serviceIpu(g);
+                if (ipuLogEnabled())
+                    std::fprintf(stderr, "[ipu] ch%u kick madr=0x%08X qwc=0x%X -> busy=%d in=%uqw out=0x%zX ch3=%d ch4=%d\n",
+                                 channel, madr, qwc, g.ipu.busy() ? 1 : 0, g.ipu.queuedInputQwords(),
+                                 g.ipu.queuedOutputBytes(), g.ch3Active ? 1 : 0, g.ch4Active ? 1 : 0);
+                return true;
+            }
+
+            // VIF1 to memory: CHCR.DIR = 0 with VIF1_STAT.FDR (bit 23, FIFO direction VIF -> memory)
+            // set by the game, i.e. a GS -> memory readback through the VIF1 FIFO (sceDmaRecvN after
+            // a TRXDIR=1 transfer). The data at MADR is the destination, not VIFcodes: it must never
+            // reach the VIF1 interpreter. A game hook can fill it (see runtime/ps2_dma_hook.h,
+            // channel 1); the transfer completes either way. (FDR is required too: some callers
+            // kick ordinary VIF1 sends with DIR = 0.)
+            const auto vif1Stat = m_ioRegisters.find(0x10003C00u);
+            const bool vif1ToMemory = vif1Stat != m_ioRegisters.end() && (vif1Stat->second & (1u << 23)) != 0u;
+            if (channelBase == 0x10009000u && (value & 0x1u) == 0u && ((value >> 2) & 0x3u) == 0u && vif1ToMemory)
+            {
+                const DmaKickHook hook = s_dmaKickHook.load(std::memory_order_acquire);
+                if (hook)
+                    hook(*this, 1u, madr, qwc, value);
+                completeAtOnce(1u);
                 return true;
             }
 
@@ -1463,11 +1736,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                 if (mode == 0 && qwc > 0)
                 {
-                    enqueueTransfer(madr, qwc);
+                    enqueueTransfer(dmaGuestAddress(madr), qwc);
                 }
                 else if (mode == 1)
                 {
-                    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
+                    uint32_t tagAddr = dmaGuestAddress(m_ioRegisters[channelBase + 0x30]);
                     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
@@ -1566,7 +1839,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
-                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
+                        uint32_t addr = dmaGuestAddress(static_cast<uint32_t>(tag >> 32)); // bit 31 = scratchpad
+                        if ((addr & 0x80000000u) != 0u)
+                            addr &= 0x7FFFFFFFu;
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
 
@@ -1729,6 +2004,41 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     const uint32_t byteCount = qwc * 16u;
     const uint32_t originalMadr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
     const uint32_t originalSadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+    const bool fromScratchpad = channelBase == kSprFromChannel;
+
+    // MADR may point at VU memory (0x11000000-0x1100FFFF), which sits on the main bus: This Is
+    // Football builds its animated bone palette in scratchpad and sends it to VU0 data memory with
+    // fromSPR (MADR 0x11004000, at 0x2B2E58). Before this the transfer was dropped.
+    {
+        uint32_t vuOffset = 0u, vuLimit = 0u;
+        if (uint8_t *vuMem = mapVuMemory(originalMadr, byteCount, vuOffset, vuLimit))
+        {
+            uint32_t scratchOffset = originalSadr;
+            for (uint32_t done = 0u; done < byteCount; done += 16u)
+            {
+                if (fromScratchpad)
+                {
+                    std::memcpy(vuMem + vuOffset + done, m_scratchpad + scratchOffset, 16u);
+                    if (vuMem == m_vu0Data)
+                        watchVu0DataWrite(vuOffset + done, vuMem);
+                }
+                else
+                {
+                    std::memcpy(m_scratchpad + scratchOffset, vuMem + vuOffset + done, 16u);
+                }
+                scratchOffset = (scratchOffset + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+            }
+            if (fromScratchpad && vuMem == m_vu0Code)
+                markVU0CodeModified();
+            if (fromScratchpad && vuMem == m_vu1Code)
+                markVU1CodeModified();
+            m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
+            m_ioRegisters[channelBase + 0x20u] = 0u;
+            m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;
+            completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
+            return true;
+        }
+    }
 
     uint32_t mainOffset = 0u;
     try
@@ -1743,7 +2053,6 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
         return false;
 
-    const bool fromScratchpad = channelBase == kSprFromChannel;
     uint32_t scratchOffset = originalSadr;
     uint32_t bytesLeft = byteCount;
     uint32_t copied = 0u;
@@ -2632,26 +2941,50 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         return 0u;
     }
 
-    if (address >= 0x10002000 && address <= 0x10002030)
+    if (address >= 0x10002000u && address < 0x10002040u)
     {
-        uint32_t val = 0;
+        IpuGlue &g = ipuGlueFor(this);
+        std::lock_guard<std::recursive_mutex> lock(g.mutex);
         switch (address)
         {
-        case 0x10002000:
-            val = m_ioRegisters[address];
-            break;
-        case 0x10002010:
-            val = m_ioRegisters[address] & ~(1u << 31);
-            break;
-        case 0x10002020:
-        case 0x10002030:
-            val = m_ioRegisters[address];
-            break;
+        case 0x10002000u:
+            return g.ipu.readCmd();
+        case 0x10002004u:
+            return g.ipu.readCmdHigh();
+        case 0x10002010u:
+            return g.ipu.readCtrl();
+        case 0x10002020u:
+            return g.ipu.readBp();
+        case 0x10002030u:
+            return g.ipu.readTop();
+        case 0x10002034u:
+            return g.ipu.readTopHigh();
         default:
-            val = 0;
-            break;
+            return 0u;
         }
-        return val;
+    }
+
+    if (address >= 0x10007000u && address < 0x10007010u) // IPU_out_FIFO: word 0 pops a quadword
+    {
+        IpuGlue &g = ipuGlueFor(this);
+        std::lock_guard<std::recursive_mutex> lock(g.mutex);
+        const uint32_t word = (address - 0x10007000u) / 4u;
+        if (word == 0u)
+        {
+            uint8_t qw[16] = {};
+            g.ipu.readOutFifo(qw);
+            std::memcpy(g.outFifo, qw, sizeof(qw));
+        }
+        return g.outFifo[word];
+    }
+
+    if (address == 0x1000B000u || address == 0x1000B400u) // IPU DMA: STR stays set while running
+    {
+        IpuGlue &g = ipuGlueFor(this);
+        std::lock_guard<std::recursive_mutex> lock(g.mutex);
+        const bool running = (address == 0x1000B000u) ? g.ch3Active : g.ch4Active;
+        if (running)
+            return m_ioRegisters[address] | 0x100u;
     }
 
     if (address == 0x10003020u) // GIF_STAT

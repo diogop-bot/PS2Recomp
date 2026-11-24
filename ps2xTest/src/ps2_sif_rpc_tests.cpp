@@ -5,6 +5,7 @@
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/ee_scheduler.h"
+#include "Kernel/Syscalls/RPC.h"
 
 #include <array>
 #include <cstdint>
@@ -523,6 +524,113 @@ void register_ps2_sif_rpc_tests()
             const SifRpcServerData sdAfterRemove = readGuestStruct<SifRpcServerData>(env.rdram.data(), kSdAddr);
             t.Equals(qdAfterRemove.link, 0u, "queue link should detach removed server");
             t.Equals(sdAfterRemove.link, 0u, "removed server link should be cleared");
+        });
+
+        tc.Run("an EE-registered server yields to an IOP server with the same SID", [](TestCase &t)
+        {
+            // SIDs are per side on hardware. This Is Football 2005 registers EE server 0x791 for
+            // PACKFS/STREAM.IRX to report to, then loads PACKFS.IRX (IOP server 0x791), then binds.
+            TestEnv env;
+
+            constexpr uint32_t kQdAddr = 0x00027000u;
+            constexpr uint32_t kSdAddr = 0x00027100u;
+            constexpr uint32_t kClientAddr = 0x00027200u;
+            constexpr uint32_t kServerBufAddr = 0x00027300u;
+            constexpr uint32_t kServerFunc = 0x00009100u;
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            setRegU32(env.ctx, 4, kQdAddr);
+            setRegU32(env.ctx, 5, 0x77u);
+            SifSetRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
+
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, 0u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kQdAddr);
+            setRegU32(env.ctx, 4, kSdAddr);
+            setRegU32(env.ctx, 5, IOP_SID_LIBSD);
+            setRegU32(env.ctx, 6, kServerFunc);
+            setRegU32(env.ctx, 7, kServerBufAddr);
+            SifRegisterRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifRegisterRpc should succeed");
+
+            EeRpcServerView eeServer{};
+            t.IsTrue(findEeRpcServer(env.rdram.data(), IOP_SID_LIBSD, eeServer),
+                     "IOP clients must find the EE-registered server");
+            t.Equals(eeServer.serverData, kSdAddr, "the EE server view should point at its descriptor");
+            t.Equals(eeServer.function, kServerFunc, "the EE server view should carry its function");
+            t.Equals(eeServer.buffer, kServerBufAddr, "the EE server view should carry its buffer");
+
+            const auto libsdModule = env.runtime.loadIopModule("rom0:LIBSD");
+            t.IsTrue(libsdModule.moduleId > 0, "LIBSD should load and own its SID on the IOP");
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, IOP_SID_LIBSD);
+            setRegU32(env.ctx, 6, 0u);
+            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            const SifRpcClientData client = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
+            t.IsTrue(client.server != 0u, "the EE client should bind");
+            t.IsTrue(client.server != kSdAddr, "the EE client must bind to the IOP server, not the EE one");
+            t.IsTrue(findEeRpcServer(env.rdram.data(), IOP_SID_LIBSD, eeServer),
+                     "the EE server stays reachable for IOP clients");
+        });
+
+        tc.Run("a client bound to an EE stand-in moves to the IOP server once it registers", [](TestCase &t)
+        {
+            // The EE binds before the IRX registers the SID, gets its own EE server as a stand-in,
+            // then calls once the IRX is up: the request must not land in the EE server's buffer.
+            TestEnv env;
+
+            constexpr uint32_t kQdAddr = 0x00028000u;
+            constexpr uint32_t kSdAddr = 0x00028100u;
+            constexpr uint32_t kClientAddr = 0x00028200u;
+            constexpr uint32_t kServerBufAddr = 0x00028300u;
+            constexpr uint32_t kSendAddr = 0x00028400u;
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            setRegU32(env.ctx, 4, kQdAddr);
+            setRegU32(env.ctx, 5, 0x78u);
+            SifSetRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, 0u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kQdAddr);
+            setRegU32(env.ctx, 4, kSdAddr);
+            setRegU32(env.ctx, 5, IOP_SID_LIBSD);
+            setRegU32(env.ctx, 6, 0u);
+            setRegU32(env.ctx, 7, kServerBufAddr);
+            SifRegisterRpc(env.rdram.data(), &env.ctx, &env.runtime);
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, IOP_SID_LIBSD);
+            setRegU32(env.ctx, 6, 0u);
+            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr).server, kSdAddr,
+                     "before the IRX registers, the EE server stands in");
+
+            const auto libsdModule = env.runtime.loadIopModule("rom0:LIBSD");
+            t.IsTrue(libsdModule.moduleId > 0, "LIBSD should load");
+
+            std::memset(env.rdram.data() + kServerBufAddr, 0xEE, 0x80);
+            std::memset(env.rdram.data() + kSendAddr, 0x11, 0x70);
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, 0u);
+            setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
+            setRegU32(env.ctx, 7, kSendAddr);
+            setRegU32(env.ctx, 8, 0x70u);
+            setRegU32(env.ctx, 9, 0u);
+            setRegU32(env.ctx, 10, 0u);
+            setRegU32(env.ctx, 11, 0u);
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, 0u);
+            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
+
+            t.IsTrue(readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr).server != kSdAddr,
+                     "the client must move to the IOP server");
+            bool untouched = true;
+            for (uint32_t i = 0; i < 0x80u; ++i)
+                untouched = untouched && env.rdram[kServerBufAddr + i] == 0xEEu;
+            t.IsTrue(untouched, "the EE server's receive buffer must not receive the IOP-bound request");
         });
 
         tc.Run("SifSetRpcQueue remove roundtrip is stable", [](TestCase &t)

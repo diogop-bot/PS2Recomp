@@ -56,6 +56,10 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] int createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits);
         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
+        // Blocks the current IOP thread until all `bits` are set in internal event flag `id`, then
+        // clears the flag (WaitEventFlag, AND + clear). False, without blocking, outside a thread
+        // (e.g. in module_start) or for an unknown flag.
+        [[nodiscard]] bool waitCurrentOnInternalEventFlag(int id, uint32_t bits, IopCpuState &cpu);
 
         void sleepCurrent(IopCpuState &cpu);
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);

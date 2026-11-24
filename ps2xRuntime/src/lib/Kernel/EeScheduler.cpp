@@ -458,7 +458,9 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // EE kernel priorities are 0 (highest) to 127; the main thread itself starts at 0.
+    // This Is Football 2005 creates its PACK file system RPC server thread at priority 0.
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -736,7 +738,7 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
+    if (priority < 0 || priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -792,6 +794,14 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
     GuestThread *self = currentThread();
     if (self && self->currentPriority == priority)
     {
+        if (m_readyQueues[priority].empty())
+        {
+            // Nobody else is ready at this priority: the caller stays at the head and keeps
+            // running, as on the EE kernel. Games yield in tight loops this way (This Is
+            // Football 2005's movie player spins on RotateThreadReadyQueue(40) while the main
+            // thread waits); a full transfer per call ran the EE at ~7% of real time.
+            return KE_OK;
+        }
         enqueueReady(*self);
         m_currentThreadId = 0;
         m_rescheduleRequested = true;

@@ -524,6 +524,26 @@ namespace ps2x::iop::detail
         return true;
     }
 
+    bool IopKernel::waitCurrentOnInternalEventFlag(int id, uint32_t bits, IopCpuState &cpu)
+    {
+        constexpr uint32_t kWaitAndClear = 0x10u;
+        const auto event = m_eventFlags.find(id);
+        if (event == m_eventFlags.end() || m_currentThread == nullptr || bits == 0u)
+            return false;
+        if (eventSatisfied(event->second, bits, kWaitAndClear))
+        {
+            event->second.bits = 0u;
+            return true;
+        }
+        m_currentThread->state = IopThreadState::EventFlag;
+        m_currentThread->waitId = id;
+        m_currentThread->waitBits = bits;
+        m_currentThread->waitMode = kWaitAndClear;
+        m_currentThread->waitResultAddress = 0u;
+        cpu.yielded = true;
+        return true;
+    }
+
     bool IopKernel::dispatchEventImport(uint16_t ordinal, IopCpuState &cpu)
     {
         const auto setV0 = [&](int32_t value)

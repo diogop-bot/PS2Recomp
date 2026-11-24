@@ -140,10 +140,10 @@ namespace ps2recomp
             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PSRLVW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI2_PMSUBW:
             return translatePMSUBW(inst);
-        case MMI2_PMFHI:
-            return fmt::format("SET_GPR_U64(ctx, {}, ctx->hi);", rd);
-        case MMI2_PMFLO:
-            return fmt::format("SET_GPR_U64(ctx, {}, ctx->lo);", rd);
+        case MMI2_PMFHI: // all 128 bits of HI: {hi, hi1}
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_set_epi64x((long long)ctx->hi1, (long long)ctx->hi));", rd);
+        case MMI2_PMFLO: // all 128 bits of LO: {lo, lo1}
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_set_epi64x((long long)ctx->lo1, (long long)ctx->lo));", rd);
         case MMI2_PINTH:
             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PINTH(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI2_PMULTW:
@@ -224,19 +224,36 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMFHLInstruction(const Instruction &inst)
     {
+        // HI and LO are 128 bits ({hi, hi1}, {lo, lo1}); Lw/Hw below are their 32-bit words.
+        // a = {L0, L1, H0, H1}, b = {L2, L3, H2, H3}; c = {L0, H0, L1, H1}, d = {L2, H2, L3, H3}.
+        static constexpr const char *kHiLo =
+            "__m128i L = _mm_set_epi64x((long long)ctx->lo1, (long long)ctx->lo); "
+            "__m128i H = _mm_set_epi64x((long long)ctx->hi1, (long long)ctx->hi); ";
         uint8_t subfunc = inst.sa;
         switch (subfunc)
         {
-        case PMFHL_LW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LW(ctx->hi, ctx->lo));", inst.rd);
-        case PMFHL_UW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_UW(ctx->hi, ctx->lo));", inst.rd);
-        case PMFHL_SLW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SLW(ctx->hi, ctx->lo));", inst.rd);
-        case PMFHL_LH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LH(ctx->hi, ctx->lo));", inst.rd);
-        case PMFHL_SH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SH(ctx->hi, ctx->lo));", inst.rd);
+        case PMFHL_LW: // {L0, H0, L2, H2}
+            return fmt::format("{{ {}__m128i c = _mm_unpacklo_epi32(L, H), d = _mm_unpackhi_epi32(L, H); "
+                               "SET_GPR_VEC(ctx, {}, _mm_unpacklo_epi64(c, d)); }}",
+                               kHiLo, inst.rd);
+        case PMFHL_UW: // {L1, H1, L3, H3}
+            return fmt::format("{{ {}__m128i c = _mm_unpacklo_epi32(L, H), d = _mm_unpackhi_epi32(L, H); "
+                               "SET_GPR_VEC(ctx, {}, _mm_unpackhi_epi64(c, d)); }}",
+                               kHiLo, inst.rd);
+        case PMFHL_SLW: // each doubleword: H:L word pair as a 64-bit value, saturated to 32 bits
+            return fmt::format("{{ auto slw = [](uint64_t h, uint64_t l) -> long long {{ "
+                               "long long v = (long long)(((uint64_t)(uint32_t)h << 32) | (uint32_t)l); "
+                               "return v > 0x7FFFFFFFLL ? 0x7FFFFFFFLL : (v < -0x80000000LL ? -0x80000000LL : v); }}; "
+                               "SET_GPR_VEC(ctx, {}, _mm_set_epi64x(slw(ctx->hi1, ctx->lo1), slw(ctx->hi, ctx->lo))); }}",
+                               inst.rd);
+        case PMFHL_LH: // low halfword of each word, no saturation: {L0, L1, H0, H1, L2, L3, H2, H3}
+            return fmt::format("{{ {}__m128i m = _mm_set1_epi32(0xFFFF); "
+                               "__m128i a = _mm_and_si128(_mm_unpacklo_epi64(L, H), m), b = _mm_and_si128(_mm_unpackhi_epi64(L, H), m); "
+                               "SET_GPR_VEC(ctx, {}, _mm_packus_epi32(a, b)); }}",
+                               kHiLo, inst.rd);
+        case PMFHL_SH: // each word saturated to 16 bits, same order as LH
+            return fmt::format("{{ {}SET_GPR_VEC(ctx, {}, _mm_packs_epi32(_mm_unpacklo_epi64(L, H), _mm_unpackhi_epi64(L, H))); }}",
+                               kHiLo, inst.rd);
         default:
             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMFHL instruction: function 0x{:X}", subfunc));
         }
@@ -249,7 +266,12 @@ namespace ps2recomp
         switch (subfunc)
         {
         case PMFHL_LW:
-            return fmt::format("{{ __m128i val = GPR_VEC(ctx, {}); ctx->lo = _mm_extract_epi32(val, 0); ctx->hi = _mm_extract_epi32(val, 1); }}", inst.rs);
+            // LO.w0 = rs.w0, HI.w0 = rs.w1, LO.w2 = rs.w2, HI.w2 = rs.w3; the odd words are kept.
+            return fmt::format("{{ __m128i val = GPR_VEC(ctx, {}); "
+                               "ctx->lo = (ctx->lo & 0xFFFFFFFF00000000ull) | (uint32_t)_mm_extract_epi32(val, 0); "
+                               "ctx->hi = (ctx->hi & 0xFFFFFFFF00000000ull) | (uint32_t)_mm_extract_epi32(val, 1); "
+                               "ctx->lo1 = (ctx->lo1 & 0xFFFFFFFF00000000ull) | (uint32_t)_mm_extract_epi32(val, 2); "
+                               "ctx->hi1 = (ctx->hi1 & 0xFFFFFFFF00000000ull) | (uint32_t)_mm_extract_epi32(val, 3); }}", inst.rs);
         default:
             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMTHL instruction: function 0x{:X}", subfunc));
         }
@@ -585,13 +607,17 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMTHI(const Instruction &inst)
     {
-        return fmt::format("ctx->hi = GPR_U32(ctx, {});", inst.rs); // PMTHI uses standard HI/LO
+        // All 128 bits: HI = {hi, hi1}.
+        return fmt::format("{{ __m128i val = GPR_VEC(ctx, {}); ctx->hi = (uint64_t)_mm_cvtsi128_si64(val); "
+                           "ctx->hi1 = (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(val, val)); }}", inst.rs);
     }
 
 
     std::string CodeGenerator::translatePMTLO(const Instruction &inst)
     {
-        return fmt::format("ctx->lo = GPR_U32(ctx, {});", inst.rs); // PMTLO uses standard HI/LO
+        // All 128 bits: LO = {lo, lo1}.
+        return fmt::format("{{ __m128i val = GPR_VEC(ctx, {}); ctx->lo = (uint64_t)_mm_cvtsi128_si64(val); "
+                           "ctx->lo1 = (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(val, val)); }}", inst.rs);
     }
 
 

@@ -283,8 +283,11 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x24: // JR
     {
+        // JR/JALR read the live VI register: the "branch sees the pre-write VI" delay applies only
+        // to the conditional branches (PCSX2 microVU: mVUanalyzeJump never calls analyzeBranchVI).
+        // This Is Football's VU1 code does `IADDIU vi01, vi00, 0` then `JALR vi15, vi01` to call 0.
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
         m_state.branchPending = true;
         m_state.branchTarget = target;
         m_state.branchDelay = 1;
@@ -294,7 +297,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     {
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask; // live VI, see JR
         if (it != 0)
             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
         m_state.branchPending = true;

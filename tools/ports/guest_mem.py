@@ -3,6 +3,8 @@
 usage: python -I guest_mem.py read  ADDR [COUNT]          floats at a guest address
        python -I guest_mem.py readw ADDR [COUNT]          32-bit words
        python -I guest_mem.py write ADDR FLOAT [FLOAT...] floats
+       python -I guest_mem.py dump  FILE                  all 32 MB of RDRAM to a file (same layout as
+                                                          eeMemory.bin in a PCSX2 save state, for diffing)
   options: --port ps2port.json   the port (default: PS2PORT_CONFIG or the nearest ps2port.json)
            --pid N               pick a process (default: the only one running the port's exe)
            --elf PATH            the game's ELF (default: the port's)
@@ -119,7 +121,8 @@ def main():
     elf = take_option(args, '--elf')
     if len(args) < 2:
         sys.exit(__doc__)
-    cmd, addr = args[0], int(args[1], 16) & (RAM_SIZE - 1)
+    cmd = args[0]
+    addr = 0 if cmd == 'dump' else int(args[1], 16) & (RAM_SIZE - 1)
     port = None
     if not pid or not elf:
         port = ps2port.load(port_path)
@@ -134,6 +137,13 @@ def main():
         fmt = '<%df' % count if cmd == 'read' else '<%dI' % count
         for k, v in enumerate(struct.unpack(fmt, raw)):
             print('0x%08x  %s' % (addr + 4 * k, ('%g' % v) if cmd == 'read' else '0x%08x' % v))
+    elif cmd == 'dump':
+        raw = read(proc, base, RAM_SIZE)
+        if raw is None:
+            sys.exit('read failed: %d' % ctypes.get_last_error())
+        with open(args[1], 'wb') as f:
+            f.write(raw)
+        print('wrote %d bytes of RDRAM to %s' % (len(raw), args[1]))
     elif cmd == 'write':
         data = struct.pack('<%df' % (len(args) - 2), *map(float, args[2:]))
         got = ctypes.c_size_t()

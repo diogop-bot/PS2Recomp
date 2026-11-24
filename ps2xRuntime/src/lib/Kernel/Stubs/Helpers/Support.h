@@ -1247,6 +1247,10 @@ namespace
             {
                 return lower;
             }
+            // Hardware DMA form of a scratchpad address: bit 31 + the offset (SCE libraries pass
+            // 0x80000000 | offset). This Is Football sends its VU1 init packet from 0x80000000.
+            if (lower < PS2_SCRATCHPAD_SIZE)
+                return PS2_SCRATCHPAD_BASE | lower;
         }
         return addr & 0x1FFFFFFFu;
     }

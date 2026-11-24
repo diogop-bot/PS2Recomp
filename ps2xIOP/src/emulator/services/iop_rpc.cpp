@@ -21,6 +21,8 @@ namespace ps2x::iop::detail
     void IopRpcBridge::reset()
     {
         m_servers.clear();
+        m_eeClients.clear();
+        ++m_generation;
         m_nextDmaId = 1u;
         m_sifInitialized = false;
     }
@@ -148,10 +150,103 @@ namespace ps2x::iop::detail
         case 10:
         case 11:
         case 14: // InitRpc
-        case 15:
-        case 16:
             setV0(0);
             return true;
+        case 15: // sceSifBindRpc(client, sid, mode): an IRX binding to a server the EE registered
+        {
+            // t_SifRpcClientData: hdr (16 bytes), command +0x10, buf +0x14, cbuf +0x18,
+            // end_function +0x1C, end_param +0x20, server +0x24. Callers retry while server == 0
+            // (STREAM.IRX and PACKFS.IRX spin on it in module_start until the EE registers).
+            const uint32_t client = cpu.gpr[4];
+            const uint32_t sid = cpu.gpr[5];
+            IopHost::EeRpcServer server{};
+            const bool found = client != 0u && m_host.findEeRpcServer(sid, server) && server.serverData != 0u;
+            if (client != 0u)
+            {
+                m_memory.write32(client + 0x10u, 0u);
+                m_memory.write32(client + 0x14u, found ? server.buffer : 0u);
+                m_memory.write32(client + 0x18u, found ? server.callbackBuffer : 0u);
+                m_memory.write32(client + 0x24u, found ? server.serverData : 0u);
+                if (found)
+                    m_eeClients[client].sid = sid;
+            }
+            setV0(0);
+            return true;
+        }
+        case 16: // sceSifCallRpc(client, fno, mode, send, ssize, recv, rsize, end_func, end_param)
+        {
+            const uint32_t client = cpu.gpr[4];
+            const uint32_t rpcNumber = cpu.gpr[5];
+            const uint32_t mode = cpu.gpr[6];
+            const uint32_t send = cpu.gpr[7];
+            const uint32_t stackPointer = cpu.gpr[29];
+            const uint32_t sendSize = m_memory.read32(stackPointer + 16u);
+            const uint32_t receive = m_memory.read32(stackPointer + 20u);
+            const uint32_t receiveSize = m_memory.read32(stackPointer + 24u);
+            const uint32_t endFunction = m_memory.read32(stackPointer + 28u);
+            const auto bound = m_eeClients.find(client);
+            if (bound == m_eeClients.end())
+            {
+                setV0(0); // not bound to an EE server: nothing to deliver
+                return true;
+            }
+            if (endFunction != 0u)
+            {
+                static bool warned = false;
+                if (!warned)
+                {
+                    warned = true;
+                    m_host.log(LogLevel::Warning, "[IOP RPC] IOP->EE call with an end function: not called");
+                }
+            }
+
+            std::vector<uint8_t> request;
+            if (send != 0u && sendSize != 0u && sendSize <= IopMemory::RamSize)
+            {
+                request.resize(sendSize);
+                if (!m_memory.readRam(send, request.data(), request.size()))
+                    request.clear();
+            }
+
+            EeClient &state = bound->second;
+            const bool nowait = (mode & 1u) != 0u;
+            if (!nowait && state.doneFlag == 0)
+                state.doneFlag = m_kernel.createInternalEventFlag(0u, 0u, 0u);
+            const int doneFlag = nowait ? 0 : state.doneFlag;
+            const uint64_t generation = m_generation;
+            state.busy = true;
+            const bool queued = m_host.callEeRpcServer(
+                state.sid, rpcNumber, request.data(), request.size(), receiveSize,
+                [this, client, receive, receiveSize, doneFlag, generation](const uint8_t *reply, size_t size)
+                {
+                    if (generation != m_generation)
+                        return;
+                    if (receive != 0u && receiveSize != 0u && size != 0u)
+                        (void)m_memory.writeRam(receive, reply, std::min<size_t>(size, receiveSize));
+                    const auto it = m_eeClients.find(client);
+                    if (it != m_eeClients.end())
+                        it->second.busy = false;
+                    if (doneFlag != 0)
+                        (void)m_kernel.setInternalEventFlag(doneFlag, 1u);
+                });
+            if (!queued)
+            {
+                state.busy = false;
+                setV0(0);
+                return true;
+            }
+            if (!nowait && !m_kernel.waitCurrentOnInternalEventFlag(doneFlag, 1u, cpu))
+            {
+                static bool warned = false;
+                if (!warned)
+                {
+                    warned = true;
+                    m_host.log(LogLevel::Warning, "[IOP RPC] blocking IOP->EE call outside an IOP thread: not awaited");
+                }
+            }
+            setV0(0);
+            return true;
+        }
         case 12: // sceSifSendCmd
         case 13: // isceSifSendCmd
         {
@@ -234,9 +329,12 @@ namespace ps2x::iop::detail
             setV0(server.serverData);
             return true;
         }
-        case 18:
-            setV0(0);
+        case 18: // sceSifCheckStatRpc(client): 1 while an IOP->EE call is still queued
+        {
+            const auto it = m_eeClients.find(cpu.gpr[4]);
+            setV0(it != m_eeClients.end() && it->second.busy ? 1u : 0u);
             return true;
+        }
         case 19: // SetRpcQueue
             setV0(cpu.gpr[4]);
             return true;

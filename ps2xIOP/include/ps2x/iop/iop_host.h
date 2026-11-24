@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -134,6 +135,39 @@ namespace ps2x::iop
             (void)commandId;
             (void)packet;
             (void)packetSize;
+            return false;
+        }
+
+        // IOP -> EE RPC: an IRX binding to (sceSifBindRpc) or calling (sceSifCallRpc) a server
+        // the EE registered with sceSifRegisterRpc. Addresses are EE addresses.
+        struct EeRpcServer
+        {
+            uint32_t serverData = 0;
+            uint32_t buffer = 0;
+            uint32_t callbackBuffer = 0;
+        };
+        virtual bool findEeRpcServer(uint32_t sid, EeRpcServer &server) const
+        {
+            (void)sid;
+            (void)server;
+            return false;
+        }
+        // Copies `send` into the server's buffer and runs its function on the EE later (not
+        // inside this call). `done` then receives `receiveSize` bytes of the reply. Returns false
+        // when the EE has no such server.
+        virtual bool callEeRpcServer(uint32_t sid,
+                                     uint32_t rpcNumber,
+                                     const uint8_t *send,
+                                     size_t sendSize,
+                                     uint32_t receiveSize,
+                                     std::function<void(const uint8_t *, size_t)> done)
+        {
+            (void)sid;
+            (void)rpcNumber;
+            (void)send;
+            (void)sendSize;
+            (void)receiveSize;
+            (void)done;
             return false;
         }
 

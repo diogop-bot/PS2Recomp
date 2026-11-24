@@ -144,6 +144,12 @@ namespace
                (static_cast<uint32_t>(is & 0xFu) << 11);
     }
 
+    uint32_t makeVuJalr(uint8_t it, uint8_t is)
+    {
+        return (0x25u << 25) | (static_cast<uint32_t>(it & 0xFu) << 16) |
+               (static_cast<uint32_t>(is & 0xFu) << 11);
+    }
+
     uint32_t makeVuIbne(uint8_t is, uint8_t it, int16_t imm)
     {
         return (0x29u << 25) |
@@ -1053,13 +1059,55 @@ void register_ps2_vu1_tests()
                      "the flag-driven branch should arrive at its target");
         });
 
-        tc.Run("JR shares the one-instruction VI branch visibility rule", [](TestCase &t)
+        tc.Run("FMAND four pairs after an FMAC reads that FMAC's sign flags (slerp pattern)", [](TestCase &t)
+        {
+            // This Is Football 2005's VU0 quaternion slerp: ADDw.x, three NOPs, FMAND with 0x80.
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            writeVuInstructionPair(fx.code, 0u, 0x10030080u /* IADDIU vi03, vi00, 0x80 */, 0x01052943u /* ADDw.x vf05, vf05, vf05w */);
+            writeVuInstructionPair(fx.code, 8u, 0x8000033Cu, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 16u, 0x8000033Cu, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 24u, 0x8000033Cu, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 32u, 0x34031800u /* FMAND vi03, vi03 */, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 40u, 0x8000033Cu, kVuUpperNop | 0x40000000u);
+            writeVuInstructionPair(fx.code, 48u, 0x8000033Cu, kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vf[5][0] = -2.0f;
+            vu1.state().vf[5][3] = 0.5f;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1000u);
+            t.Equals(vu1.state().vi[3], 0x80, "FMAND should see the x sign flag of the ADD four pairs earlier");
+        });
+
+        tc.Run("an FMAC writing vf00 still sets MAC flags (slerp pattern)", [](TestCase &t)
+        {
+            // SUBi.xz vf00, vf05, I computes only for its flags; FMAND four pairs later reads them.
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            writeVuInstructionPair(fx.code, 0u, 0x100200A0u /* IADDIU vi02, vi00, 0xA0 */, 0x01402826u /* SUBi.xz vf00, vf05, I */);
+            writeVuInstructionPair(fx.code, 8u, 0x8000033Cu, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 16u, 0x8000033Cu, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 24u, 0x8000033Cu, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 32u, 0x34021000u /* FMAND vi02, vi02 */, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 40u, 0x8000033Cu, kVuUpperNop | 0x40000000u);
+            writeVuInstructionPair(fx.code, 48u, 0x8000033Cu, kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vf[5][0] = 0.5f;
+            vu1.state().vf[5][2] = 0.25f;
+            vu1.state().i = 0.9999f;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1000u);
+            t.Equals(vu1.state().vi[2], 0xA0, "x and z results are negative: their sign flags must be set");
+            t.Equals(vu1.state().vf[0][0], 0.0f, "vf00 itself stays (0,0,0,1)");
+        });
+
+        tc.Run("JR reads the VI value written by the instruction just before it", [](TestCase &t)
         {
             Vu1Fixture fx;
             t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
 
             writeVuInstructionPair(
-                fx.code, 0u, makeVuIaddiu(1u, 0u, 2),
+                fx.code, 0u, makeVuIaddiu(1u, 0u, 4),
                 kVuUpperNop);
             writeVuInstructionPair(
                 fx.code, 8u, makeVuJr(1u),
@@ -1075,19 +1123,44 @@ void register_ps2_vu1_tests()
                 kVuUpperNop);
 
             VU1Interpreter vu1;
-            vu1.state().vi[1] = 4;
+            vu1.state().vi[1] = 3;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
                         fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
                         0u, 0u, 0u, 4u);
 
-            t.Equals(vu1.state().vi[1], 2,
+            t.Equals(vu1.state().vi[1], 4,
                      "the pending IALU write should still commit normally");
             t.Equals(vu1.state().vi[2], 2,
                      "JR should execute exactly one delay-slot pair");
             t.Equals(vu1.state().vi[3], 0,
-                     "JR should skip the sequential instruction after its delay slot");
+                     "JR should not land on the old target (pair 24) or run the sequential pair");
             t.Equals(vu1.state().vi[4], 4,
-                     "JR immediately after a VI write should branch using the previous VI value");
+                     "JR immediately after a VI write should branch using the new VI value (as PCSX2 does)");
+        });
+
+        tc.Run("JALR calls the address set by the instruction just before it", [](TestCase &t)
+        {
+            // This Is Football 2005: IADDIU vi01, vi00, 0 ; JALR vi15, vi01 calls a subroutine at 0
+            // while vi01 still held a stack pointer. Reading the old vi01 sent VU1 into garbage.
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(fx.code, 0u, makeVuIaddiu(1u, 0u, 4), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 8u, makeVuJalr(15u, 1u), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 16u, makeVuIaddiu(2u, 0u, 2), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 24u, makeVuIaddiu(3u, 0u, 3), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 32u, makeVuIaddiu(4u, 0u, 4), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vi[1] = 3;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 4u);
+
+            t.Equals(vu1.state().vi[2], 2, "JALR should execute its delay slot");
+            t.Equals(vu1.state().vi[3], 0, "JALR should not jump to the old vi01 target");
+            t.Equals(vu1.state().vi[4], 4, "JALR should jump to the new vi01 target");
+            t.Equals(vu1.state().vi[15], 3, "JALR should link to the pair after its delay slot");
         });
 
         tc.Run("MPG upload invalidates cached VU1 decode before MSCAL", [](TestCase &t)

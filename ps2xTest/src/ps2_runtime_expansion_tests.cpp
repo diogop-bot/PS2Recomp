@@ -975,10 +975,12 @@ void register_ps2_runtime_expansion_tests()
 
             t.IsFalse(runtime.isStopRequested(),
                       "sceIpuInit should tolerate the missing optional SetD4 helper");
-            t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
-                     "sceIpuInit should still program IPU_CTRL");
-            t.Equals(runtime.memory().read32(0x10002000u), 0u,
-                     "sceIpuInit should leave IPU_CMD reset after initialization");
+            // The IPU is emulated (runtime/ps2_ipu.h): CTRL.RST does not read back, the IPU is idle
+            // with an empty FIFO after the reset + BCLR that end sceIpuInit.
+            t.Equals(runtime.memory().read32(0x10002010u) & 0xC000000Fu, 0u,
+                     "sceIpuInit should leave the IPU reset, idle and with an empty FIFO");
+            t.Equals(runtime.memory().read32(0x10002020u), 0u,
+                     "sceIpuInit should leave IPU_BP cleared");
         });
 
         tc.Run("IPU init executes its guest helper as a scheduler invocation", [](TestCase &t)
@@ -992,6 +994,14 @@ void register_ps2_runtime_expansion_tests()
             gIpuSetD4Argument.store(0u, std::memory_order_release);
             gIpuInitResult.store(-999, std::memory_order_release);
 
+            // Three quadwords queued in the IPU before init: only a completed init (reset + BCLR)
+            // empties them. (Memory first, so sceIpuInit does not re-initialize it.)
+            if (!runtime.memory().getRDRAM())
+                t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            for (uint32_t i = 0; i < 12u; ++i)
+                runtime.memory().write32(0x10007010u + 4u * (i & 3u), 0x11111111u * (i + 1u));
+            t.IsTrue(runtime.memory().read32(0x10002020u) != 0u, "the IPU should hold the queued quadwords");
+
             R5900Context context{};
             context.pc = kIpuInitMainPc;
             runtime.eeScheduler().reset(rdram.data(), context);
@@ -1003,8 +1013,8 @@ void register_ps2_runtime_expansion_tests()
                      "the invocation should receive the SetD4 enable argument");
             t.Equals(gIpuInitResult.load(std::memory_order_acquire), 0,
                      "the HLE completion should resume the preserved base context with success");
-            t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
-                     "IPU initialization should finish only after the guest invocation completes");
+            t.Equals(runtime.memory().read32(0x10002020u), 0u,
+                     "IPU initialization should finish (FIFO cleared) after the guest invocation completes");
         });
 
         tc.Run("sprintf consumes EE varargs from a2 a3 t0 and preserves width formatting", [](TestCase &t)
