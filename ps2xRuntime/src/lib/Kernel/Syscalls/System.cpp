@@ -6,7 +6,7 @@ namespace ps2_syscalls
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
-        int videoMode = getRegU32(ctx, 5);  // $a1 - 0=NTSC, 1=PAL, 2=VESA, 3=HiVision
+        int videoMode = getRegU32(ctx, 5);  // $a1 - 2=NTSC, 3=PAL (0x1A.. VESA, 0x50.. DTV)
         int frameMode = getRegU32(ctx, 6);  // $a2 - 0=field, 1=frame
 
         if (runtime)
@@ -17,6 +17,20 @@ namespace ps2_syscalls
                 ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
 
             gs.smode2 = smode2;
+
+            // The BIOS also programs the CRTC timing registers. A GS that follows real hardware
+            // (PCSX2's) reads them to identify the video mode (SMODE1.CMOD) and whether fields
+            // alternate (SYNCV.VFP odd + CMOD). Values as the BIOS writes them.
+            if (videoMode == 3) // PAL
+            {
+                gs.smode1 = 0x0000000740836504ull;
+                gs.syncv = 0x00A9000502101401ull;
+            }
+            else if (videoMode == 2) // NTSC
+            {
+                gs.smode1 = 0x0000000740834504ull;
+                gs.syncv = 0x00C7800601A01801ull;
+            }
 
             // Keep CRT1 enabled after the BIOS syscall selects a display mode.
             if ((gs.pmode & 0x3ull) == 0ull)

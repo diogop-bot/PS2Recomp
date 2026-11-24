@@ -15,6 +15,7 @@
 #include "ps2x/iop/iop_subsystem.h"
 #include "runtime/ps2_host_hooks.h"
 #include "runtime/ps2_vif0_mscal.h"
+#include "runtime/ps2_gs_readback.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -94,14 +95,16 @@ struct ProgramHeader
 namespace
 {
     // VU1 cycles one MSCAL/MSCNT may run before the interpreter returns (the rest of that program
-    // is lost). PS2X_VU1_BUDGET=<cycles> overrides the default.
+    // is lost). Only a safety net against a program that never ends: real programs can stall far
+    // past 65536 cycles (This Is Football's match programs lost geometry at that limit).
+    // PS2X_VU1_BUDGET=<cycles> overrides the default.
     uint32_t vu1CycleBudget()
     {
         static const uint32_t budget = []
         {
             const char *env = std::getenv("PS2X_VU1_BUDGET");
             const unsigned long v = env ? std::strtoul(env, nullptr, 0) : 0ul;
-            return v ? static_cast<uint32_t>(v) : 65536u;
+            return v ? static_cast<uint32_t>(v) : 16777216u;
         }();
         return budget;
     }
@@ -549,6 +552,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        setGsReadbackSource(nullptr); // the default source reads this runtime's GS
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -729,6 +733,9 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    // VIF1 -> memory readbacks come from this runtime's GS unless a port installs another source.
+    setGsReadbackSource([this](uint8_t *dst, uint32_t maxBytes)
+                        { return m_gs.consumeLocalToHostBytes(dst, maxBytes); });
     // VIF0 MSCAL/MSCALF: run the VU0 microprogram now, on the current EE context's VU0 registers.
     setVif0MscalHandler([this](uint32_t startPC, uint32_t itop)
                         {

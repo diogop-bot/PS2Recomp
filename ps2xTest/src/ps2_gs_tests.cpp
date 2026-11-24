@@ -518,6 +518,26 @@ void register_ps2_gs_tests()
                      "GsSetCrt should return success");
         });
 
+        tc.Run("GsSetCrt programs the BIOS CRTC timing (SMODE1, SYNCV) for PAL and NTSC", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+            setRegU32(ctx, 4, 1u); // interlaced
+            setRegU32(ctx, 6, 0u); // field mode
+
+            setRegU32(ctx, 5, 3u); // PAL
+            GsSetCrt(rdram.data(), &ctx, &runtime);
+            t.Equals(runtime.memory().gs().smode1, 0x0000000740836504ull, "PAL SMODE1");
+            t.Equals(runtime.memory().gs().syncv, 0x00A9000502101401ull, "PAL SYNCV");
+
+            setRegU32(ctx, 5, 2u); // NTSC
+            GsSetCrt(rdram.data(), &ctx, &runtime);
+            t.Equals(runtime.memory().gs().smode1, 0x0000000740834504ull, "NTSC SMODE1");
+            t.Equals(runtime.memory().gs().syncv, 0x00C7800601A01801ull, "NTSC SYNCV");
+        });
+
         tc.Run("sceGsSetDefDBuffDc seeds display envs and swap applies the selected page", [](TestCase &t)
         {
             PS2Runtime runtime;

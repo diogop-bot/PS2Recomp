@@ -88,6 +88,7 @@ All off by default; the runtime reads them once at start. Pair them with `vu1/vu
 | `PS2X_VU1_TRACE=<file>` | Per-instruction VU1 trace: cycle, pc, both instruction words and the VI registers that changed. Arms when a run starts at `PS2X_VU1_TRACE_PC` (default any), after `PS2X_VU1_TRACE_SKIP` such starts, then logs `PS2X_VU1_TRACE_MAX` pairs (default 200000) across later MSCNT resumes. On arming it writes `<file>.vucode`/`.vumem` and the VF/VI state, and `<file>.end.vumem` when that first run stops. |
 | `PS2X_VU1_TRACE_DATA=<byte addr>,<word>`, `PS2X_VU1_TRACE_AFTER_SEC=<s>`, `PS2X_VU1_TRACE_AFTER=<cycles>` | Extra arming conditions for `PS2X_VU1_TRACE`: a VU1 data word must hold that value (e.g. `0x24,0x3C23D70A` catches models whose up row is scale 0.01); at least that many seconds since the first VU1/VU0 run; the run's cycle counter at least that (it restarts at every MSCAL, so it is no clock). |
 | `PS2X_VU1_LONG_RUNS=1`, `PS2X_VU1_RUN_PC=<pc>` | One line per run longer than 100k cycles (or starting at that pc): start/end pc, cycles, TOP and the four words at TOP. |
+| `PS2X_VU1_BUDGET=<cycles>` | Cycles one MSCAL/MSCNT may run before the rest of the program is dropped (default 16777216; it was 65536 before 2026-11-24, too short for This Is Football's match). |
 | `PS2X_VU1_BUDGET_DUMP=<file>` | Code and data at the first run cut off by the cycle budget (a program that never reaches its E bit). |
 | `PS2X_XGKICK_DUMP=<file>` | First XGKICK with no EOP within 64 KB: every GIFtag walked, VI registers at the kick, code and data. Such packets are dropped and logged as `[vu1] XGKICK from ... packet dropped`. |
 | `PS2X_VU1_STORE_WATCH=<byte addr>` | VU1 stores to that quadword (pc, value, VI registers); also EE writes into VU1 data below 0x50. |
@@ -97,6 +98,7 @@ All off by default; the runtime reads them once at start. Pair them with `vu1/vu
 | `PS2X_VU0_DUMP=<file>[,<pc>]`, `PS2X_VU0_DUMP_SKIP=<n>` | Before the first VCALLMS/VCALLMSR (to that pc, after n such calls): `<file>.vucode`, `<file>.vumem` and `<file>.regs` (VF in hex, ACC/I/Q, VI). Read the code with `vudis.py`. |
 | `PS2X_VU0_DATA_WATCH=<byte addr>` | Writes to that VU0 data quadword: EE stores and SPR DMA (`[ee:vu0data]`) and VU0 micro stores (`[vu0:store]`, with pc and vi14). VIF0 UNPACKs are not reported. |
 | `PS2X_VIF0_LOG=1` | Distinct VIF0 UNPACK shapes, the first 20 MSCALs (with ITOPS and the next codes), codes kept waiting for more data, and unhandled VIF0 codes (MSCNT etc. drop the rest of the packet). |
+| `PS2X_GS_READBACK_LOG=1`, `PS2X_GS_READBACK_DUMP=<prefix>` | VIF1 -> memory GS readbacks: the first 20 (destination, bytes asked and filled); the first 10 written to `<prefix>_<n>.bin`. |
 | `PS2X_INTC_LOG=1` | Every AddIntcHandler/AddDmacHandler: cause, handler, next, argument. |
 | `PS2X_VIF0_MSCAL=0` / `=drop` | A/B diagnostics: ignore VIF0 MSCAL/MSCALF, or the old behaviour (MSCAL unhandled, rest of the packet dropped). |
 | `PS2X_VIF1_MPG_LOG=1`, `PS2X_VIF1_DROP_LOG=1` | MPG uploads (then MSCAL/MSCNT); UNPACK/MPG payloads that run past their DMA chunk. |

@@ -14,7 +14,11 @@
 
 class PS2Memory;
 
-// channel: DMAC channel number (3 or 4). madr/qwc/chcr: the channel registers at the kick.
+// The hook is also called for VIF1 -> memory kicks (channel 1, a GS readback): returning true there
+// means the hook filled the destination; false leaves it to the GS readback source
+// (runtime/ps2_gs_readback.h). Either way the kick completes.
+//
+// channel: DMAC channel number (1, 3 or 4). madr/qwc/chcr: the channel registers at the kick.
 using DmaKickHook = bool (*)(PS2Memory &memory, uint32_t channel, uint32_t madr, uint32_t qwc, uint32_t chcr);
 
 void setDmaKickHook(DmaKickHook hook);

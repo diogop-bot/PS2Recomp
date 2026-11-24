@@ -1,6 +1,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vif0_mscal.h"
 #include "runtime/ps2_dma_hook.h"
+#include "runtime/ps2_gs_readback.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_ipu.h"
 #include "runtime/gs/gs_frontend.h"
@@ -1360,6 +1361,57 @@ void setDmaKickHook(DmaKickHook hook)
     s_dmaKickHook.store(hook, std::memory_order_release);
 }
 
+namespace
+{
+    std::mutex s_gsReadbackMutex;
+    GsReadbackSource s_gsReadbackSource;
+}
+
+void setGsReadbackSource(GsReadbackSource source)
+{
+    std::lock_guard<std::mutex> lock(s_gsReadbackMutex);
+    s_gsReadbackSource = std::move(source);
+}
+
+namespace
+{
+    // VIF1 -> memory (GS local -> host): MADR/QWC name the destination in RDRAM.
+    void readbackFromGs(PS2Memory &memory, uint32_t madr, uint32_t qwc)
+    {
+        GsReadbackSource source;
+        {
+            std::lock_guard<std::mutex> lock(s_gsReadbackMutex);
+            source = s_gsReadbackSource;
+        }
+        memory.syncGsWorker("vif1 readback");
+        uint8_t *rdram = memory.getRDRAM();
+        const uint32_t start = madr & (PS2_RAM_SIZE - 1u) & ~15u;
+        const uint32_t bytes = std::min<uint32_t>((qwc & 0xFFFFu) * 16u, PS2_RAM_SIZE - start);
+        const uint32_t got = source ? source(rdram + start, bytes) : 0u;
+
+        static std::atomic<int> count{0};
+        const int nth = count.fetch_add(1);
+        static const bool log = []
+        {
+            const char *e = std::getenv("PS2X_GS_READBACK_LOG");
+            return e && *e && *e != '0';
+        }();
+        if (log && nth < 20)
+            std::fprintf(stderr, "[gs] VIF1 readback #%d -> 0x%X: 0x%X bytes asked, 0x%X from the GS\n", nth, madr,
+                         bytes, got);
+        if (const char *dump = std::getenv("PS2X_GS_READBACK_DUMP"); dump && *dump && nth < 10)
+        {
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s_%d.bin", dump, nth);
+            if (FILE *f = std::fopen(path, "wb"))
+            {
+                std::fwrite(rdram + start, 1, bytes, f);
+                std::fclose(f);
+            }
+        }
+    }
+}
+
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
     if (address >= 0x10003000u && address < 0x10007000u)
@@ -1733,16 +1785,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             // VIF1 to memory: CHCR.DIR = 0 with VIF1_STAT.FDR (bit 23, FIFO direction VIF -> memory)
             // set by the game, i.e. a GS -> memory readback through the VIF1 FIFO (sceDmaRecvN after
             // a TRXDIR=1 transfer). The data at MADR is the destination, not VIFcodes: it must never
-            // reach the VIF1 interpreter. A game hook can fill it (see runtime/ps2_dma_hook.h,
-            // channel 1); the transfer completes either way. (FDR is required too: some callers
-            // kick ordinary VIF1 sends with DIR = 0.)
+            // reach the VIF1 interpreter. The GS readback source fills it (runtime/ps2_gs_readback.h)
+            // unless a game hook takes the kick (runtime/ps2_dma_hook.h, channel 1, returns true);
+            // the transfer completes either way. (FDR is required too: some callers kick ordinary
+            // VIF1 sends with DIR = 0.)
             const auto vif1Stat = m_ioRegisters.find(0x10003C00u);
             const bool vif1ToMemory = vif1Stat != m_ioRegisters.end() && (vif1Stat->second & (1u << 23)) != 0u;
             if (channelBase == 0x10009000u && (value & 0x1u) == 0u && ((value >> 2) & 0x3u) == 0u && vif1ToMemory)
             {
                 const DmaKickHook hook = s_dmaKickHook.load(std::memory_order_acquire);
-                if (hook)
-                    hook(*this, 1u, madr, qwc, value);
+                if (!hook || !hook(*this, 1u, madr, qwc, value))
+                    readbackFromGs(*this, madr, qwc);
                 completeAtOnce(1u);
                 return true;
             }

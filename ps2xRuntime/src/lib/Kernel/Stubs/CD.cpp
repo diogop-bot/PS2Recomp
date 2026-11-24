@@ -550,6 +550,13 @@ namespace ps2_stubs
         sceCdRead(rdram, ctx, runtime);
     }
 
+    // sceCdLayerSearchFile(file, path, layer): sceCdSearchFile on one layer of a dual-layer DVD.
+    // The runtime reads the disc as one image, so the layer argument (a2) changes nothing.
+    void sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        sceCdSearchFile(rdram, ctx, runtime);
+    }
+
     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t fileAddr = getRegU32(ctx, 4);

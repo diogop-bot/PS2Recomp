@@ -3,6 +3,7 @@
 #include "runtime/ps2_vif1_irq.h"
 #include "runtime/ps2_vif0_mscal.h"
 #include "runtime/ps2_dma_hook.h"
+#include "runtime/ps2_gs_readback.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "ps2_runtime.h"
@@ -1423,6 +1424,36 @@ void register_ps2_memory_tests()
             t.Equals(hookCalls, 1, "the readback should reach the hook once");
             t.Equals(hookChannel, 1u, "as channel 1");
             t.Equals(mem.vif1_regs.row[0], 0u, "the destination must not be interpreted as VIFcodes");
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.IsTrue(causes.size() == 1u && causes[0] == 1u, "DMAC cause 1 should be queued");
+        });
+
+        tc.Run("VIF1 to memory without a game hook is filled from the GS readback source", [](TestCase &t)
+        {
+            static uint32_t asked = 0;
+            asked = 0;
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            setGsReadbackSource([](uint8_t *dst, uint32_t maxBytes)
+                                {
+                                    asked = maxBytes;
+                                    std::memset(dst, 0xAB, 24u); // a short readback: 24 of 32 bytes
+                                    return 24u;
+                                });
+            // A hook that declines the kick (returns false) leaves the readback to the source.
+            setDmaKickHook([](PS2Memory &, uint32_t, uint32_t, uint32_t, uint32_t) { return false; });
+            mem.writeIORegister(0x10003C00u, 1u << 23); // VIF1_STAT.FDR: VIF -> memory
+            mem.writeIORegister(0x10009010u, 0x3000u);
+            mem.writeIORegister(0x10009020u, 2u);
+            mem.writeIORegister(0x10009000u, 0x100u);
+            setDmaKickHook(nullptr);
+            setGsReadbackSource(nullptr);
+            const uint8_t *rdram = mem.getRDRAM();
+            t.Equals(asked, 32u, "the source should be asked for QWC * 16 bytes");
+            t.Equals(static_cast<uint32_t>(rdram[0x3000u]), 0xABu, "the destination should hold the GS data");
+            t.Equals(static_cast<uint32_t>(rdram[0x3017u]), 0xABu, "up to the bytes the source wrote");
+            t.Equals(static_cast<uint32_t>(rdram[0x3018u]), 0u, "and no further");
+            t.Equals(mem.readIORegister(0x10009000u) & 0x100u, 0u, "CHCR.STR should be clear");
             const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
             t.IsTrue(causes.size() == 1u && causes[0] == 1u, "DMAC cause 1 should be queued");
         });

@@ -784,6 +784,9 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // g_gparam starts as "interlaced NTSC" and only this stand-in sets it from the game's request.
+    std::atomic<bool> s_gparamFromResetGraph{false};
+
     void sceGsResetGraph(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t mode = getRegU32(ctx, 4);
@@ -802,6 +805,7 @@ namespace ps2_stubs
             g_gparam.interlace = static_cast<uint8_t>(interlace & 0x1);
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
+            s_gparamFromResetGraph.store(true, std::memory_order_relaxed);
             writeGsGParamToScratch(runtime);
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
@@ -1282,10 +1286,16 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // g_gparam is only filled by the runtime's sceGsResetGraph stand-in (its default says
+        // interlaced). A game that keeps its own libgraph reset still goes through SetGsCrt, which
+        // sets SMODE2.INT: use that when the stand-in never ran.
+        const bool interlaced = s_gparamFromResetGraph.load(std::memory_order_relaxed)
+                                    ? g_gparam.interlace != 0u
+                                    : (runtime && (runtime->memory().gs().smode2 & 1u) != 0u);
         ps2_syscalls::WaitVSyncTick(rdram,
                                     ctx,
                                     runtime,
-                                    g_gparam.interlace != 0u ? -1 : 1);
+                                    interlaced ? -1 : 1);
     }
 
     void sceGsSyncVCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
