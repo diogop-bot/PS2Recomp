@@ -1,6 +1,9 @@
 #include "Common.h"
 #include "Interrupt.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace ps2_syscalls
 {
     namespace
@@ -36,6 +39,11 @@ namespace ps2_syscalls
                                               getRegU32(ctx, 7),
                                               getRegU32(ctx, 28),
                                               getRegU32(ctx, 29));
+            // PS2X_INTC_LOG=1: every INTC/DMAC handler registration (cause, handler, next, arg).
+            static const bool log = std::getenv("PS2X_INTC_LOG") != nullptr;
+            if (log)
+                std::fprintf(stderr, "[intc] Add%sHandler cause=%u handler=0x%X next=%d arg=0x%X -> id %d%c", dmac ? "Dmac" : "Intc",
+                             getRegU32(ctx, 4), getRegU32(ctx, 5), static_cast<int>(getRegU32(ctx, 6)), getRegU32(ctx, 7), id, 10);
             setReturnS32(ctx, id);
         }
 

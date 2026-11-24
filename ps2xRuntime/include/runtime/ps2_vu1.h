@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 
 class GS;
 class PS2Memory;
@@ -227,6 +228,9 @@ private:
     uint64_t m_cycle = 0;
     uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
+    // Earliest readyCycle of any queued pipeline entry (~0 when none): commitReadyPipelines
+    // returns at once before it. Every queue site lowers it.
+    uint64_t m_nextCommitCycle = ~0ull;
     uint32_t m_workingClip = 0;
     uint32_t m_currentUpperInstruction = 0;
     int32_t m_viBranchBackupValue = 0;
@@ -287,7 +291,19 @@ private:
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
 
-    float normalizeOperand(float value) const;
+    // Inline: called for every FMAC operand from three translation units.
+    float normalizeOperand(float value) const
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const uint32_t exponent = (bits >> 23) & 0xFFu;
+        if (exponent == 0u)
+            bits &= 0x80000000u;
+        else if (exponent == 0xFFu)
+            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
     float normalizeResult(float value, uint32_t &laneFlags) const;
     uint32_t microAddressMask() const;
     int32_t readBranchVi(uint8_t reg) const;

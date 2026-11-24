@@ -148,6 +148,7 @@ All fixed in our fork (`diogop-bot/PS2Recomp`, branch `midnightclub-fixes`; the 
 | `sceMcGetDir` ignored flags (continue) | save list showed one profile | keep the listing, resume on flags != 0 |
 | `sceSifFreeIopHeap` is game code that RPCs an IOP heap server the HLE lacks | IOP memory leaked per movie; race music buffer failed; menu hang after a race | bind it to the runtime's free |
 | VIF1 `DIRECT` + `IMAGE` split across two DMA pieces | every texture shifted 8 bytes: colours rotated (yellow → purple), VU code corrupted | take the image data from the next DIRECT payload |
+| VIF0 i bit didn't stall VIF0; VIF0 register reads came from a generic map | This Is Football's match: an intermittent freeze (2-4 of 6 runs) with the main loop polling `VIF0_STAT.INT` | stall after an i-bit code until `FBRST.STC`; back VIF0 register reads with `vif0_regs` (section 13) |
 | SPR DMA to/from VU memory (MADR `0x11004000`) dropped; VIF0 stateless across transfers | This Is Football: animated bone palette never reached VU0, players skinned with a static palette (section 13) | map VU memory in the SPR engine; keep incomplete VIF0 codes for the next transfer |
 | GIF arbiter lost path ids | PCSX2 needs per-path state | pass `GifPathId` to the consumer |
 | Pad ignored the keyboard when a gamepad was connected | automation key presses vanished | always read both |
@@ -279,6 +280,19 @@ Architecture (`src/gs/`, `src/mc_gs_bridge.cpp`):
 7. Remaining overhead: heap allocations, SRW locks, unordered_map lookups for IO registers, EE timer
    upkeep on the game thread; the runtime GS frontend's unused draw batching (~5%).
 
+This Is Football (2026-11-24) is still interpreted on VU0 and VU1. About 12,000 VU0 `vcallmsr`
+per frame plus VU1 MSCALs kept the EE thread 100% in `VU1Interpreter`. Measure it with
+`sample_profile.py --classify VU0=executeVU0Microprogram,VU1=syncCoreSubsystems`. Three
+interpreter fixes, with no change to the cycle model:
+- `resetScheduler` did `m_xgkick = {}`, which zero-filled the 64 KB XGKICK packet buffer at every
+  program start (23% of the EE thread). It now resets only the bookkeeping.
+- `commitReadyPipelines` scanned all 51 pipeline slots every cycle. It now returns at once before
+  `m_nextCommitCycle`, the earliest ready cycle of any queued entry.
+- `normalizeOperand` is now inline in `ps2_vu1.h`; it was called out of line for every FMAC operand.
+
+Together they took team select from 4-5 to 7-8 fps. Changing `ps2_vu1.h` rebuilds every generated
+file (36 min for TIF). The next step is AOT for VU0 macro calls and for TIF's VU1 overlays.
+
 ### The GS worker thread (fork: `PS2Memory::setGsWorker`)
 - On GIF/VIF1 DMA kicks, copy the data (chained transfers already were copied) and **complete the
   DMA at once, as before**; a worker thread unpacks VIF1, runs VU1 and feeds the GS, in order.
@@ -373,7 +387,8 @@ microcode: it doesn't support an E bit on a branch.
 | No IPU | MPEG pictures magenta | `runtime/ps2_ipu.h` (core from PCSX2's IPU, GPL): synchronous, stalls re-run from the command start; IDEC forces PCT = I-picture like PCSX2 |
 | Recompiler: VU0 macro `VSQD`/`VSQI` swapped the VF and VI fields (and `VLQ*`/`VSQ*`/`VILWR`/`VISWR` addressed RAM, not VU0 data memory) | stores went to the wrong VU0 quadwords: the root bone of every skeleton was corrupted | VF = fs (rd field), VI = it (rt field); address `0x11004000 + (vi & 0xFF) * 16`; VI updates are 16-bit and never write vi0 |
 | Runtime: an SPR DMA whose MADR is VU memory (`0x11000000`-`0x1100FFFF`) was dropped (`translateAddress` gave 0x11004000, failing the RAM bounds check) | **players mangled** (stretched torsos, stick arms) in the front end and the match: TIF builds the animated bone palette (pose x inverse bind, `FUN_42D1A0`) in scratchpad and sends it to VU0 data with fromSPR, MADR `0x11004000` (`0x2B2E58`). VU0 kept a static palette, so every frame was skinned with it | `tryProcessScratchpadDma` maps VU memory through `mapVuMemory` first. The DMAC can address VU memory; any engine that resolves MADR (VIF/GIF normal and chain modes) should do the same |
-| Runtime: VIF0 parsed every FIFO write and DMA chunk on its own, and dropped `MSCAL` with the rest of the packet | the match sends `ITOP` + `UNPACK` + `MSCAL 0x100` + `FLUSHE` (i bit) through VIF0 every frame (a 60-element integration program at VU0 0x800, reading vf29-vf31 set by the EE); it never ran. Over 110 s runs the game stopped presenting frames in 2 of 3 runs with the old drop and 1 of 6 with MSCAL handled. A FIFO-written UNPACK whose data comes by DMA (`0x2B2340`, found by reading the code, not seen running) lost both header and data | VIF0 keeps an incomplete VIFcode and what has arrived of its payload until the next transfer; `MSCAL`/`MSCALF` run the VU0 program at once on the current EE context (`runtime/ps2_vif0_mscal.h`, installed by the runtime; `MSCNT` still unhandled); UNPACK wraps at 0x100 quadwords and decodes every format (8/16-bit with USN, S broadcast, V4-5, masks, modes; only V4-32 and S-16 are unit-tested). Not done for VIF1 (it logs drops with `PS2X_VIF1_DROP_LOG`). The VIF0 i bit is not raised as an interrupt |
+| Runtime: VIF0 parsed every FIFO write and DMA chunk on its own, and dropped `MSCAL` with the rest of the packet | the match sends `ITOP` + `UNPACK` + `MSCAL 0x100` + `FLUSHE` (i bit) through VIF0 every frame (a 60-element integration program at VU0 0x800, reading vf29-vf31 set by the EE); it never ran. (The intermittent freeze seen then was the i-bit stall in the next row.) A FIFO-written UNPACK whose data comes by DMA (`0x2B2340`, found by reading the code, not seen running) lost both header and data | VIF0 keeps an incomplete VIFcode and what has arrived of its payload until the next transfer; `MSCAL`/`MSCALF` run the VU0 program at once on the current EE context (`runtime/ps2_vif0_mscal.h`, installed by the runtime; `MSCNT` still unhandled); UNPACK wraps at 0x100 quadwords and decodes every format (8/16-bit with USN, S broadcast, V4-5, masks, modes; only V4-32 and S-16 are unit-tested). Not done for VIF1 (it logs drops with `PS2X_VIF1_DROP_LOG`). The VIF0 i bit stalls VIF0 (next row) but is not raised as an INTC interrupt (TIF registers no VIF0 handler) |
+| Runtime: VIF0 ran a whole DMA chain at once, ignoring the i bit's stall, and `VIF0_STAT` reads came from a generic register map | The match froze in 2-4 of 6 runs at the line-up. The main thread spun at `0x2BD430` polling `VIF0_STAT.INT`. The game sends a VIF0 chain of packets (UNPACK, MSCAL, `FLUSHE`+i). Between packets it reads each VU0 result with toSPR and writes `FBRST.STC`. Run all at once, the results were overwritten and INT never came back after the first STC | After a code with the i bit VIF0 sets STAT.INT and keeps the rest of the stream; data arriving meanwhile queues behind it; `FBRST.STC` resumes it. VIF0 register reads and writes (STAT, FBRST, ERR, MARK, CYCLE, ..., ROW, COL) use `vif0_regs`. 0 stalls in 6 runs after. VIF1 STAT reads still use the map |
 
 Method that worked for VU1 problems:
 1. `PS2X_VU1_LONG_RUNS=1` finds programs that never end. A `[VU1 reserved lower] 0xfffffffb` is an
@@ -395,6 +410,14 @@ Method that worked for VU1 problems:
    the same transform. Here they matched, which ruled out VU1 for the missing objects.
 6. Overlays are placed dynamically and patched per placement (`JALR` in one layout, `BAL` in
    another), so compare code by content, not by address.
+
+How the freeze was found (2026-11-24):
+- Frame-wait counts (`TIF_TRACE=2`, cheap) separated stalled runs from slow ones. In a stall the
+  timer-alarm interrupts kept firing at their normal rate and EE cycles advanced at real time,
+  but the main loop never reached its frame wait.
+- `sample_profile.py --stacks .` on a stalled run named the guest loop, `entry_002bd430`.
+- Its disassembly showed the `VIF0_STAT` poll.
+- Heavy per-call tracing made the stall vanish, so keep instrumentation to counters.
 
 Method that worked for wrong geometry (EE + VU0 skinning, 2026-11-24):
 1. Find the buffer VU1 draws from: decode the VIF1 packet (`UNPACK V3-16` REF tags) and watch a

@@ -1953,8 +1953,26 @@ void register_ps2_memory_tests()
             t.Equals(gotItop, 0x7Eu, "the handler should get VIF0 ITOPS");
             uint32_t qw2[4] = {};
             std::memcpy(qw2, mem.getVU0Data() + 0x20u, sizeof(qw2));
+            t.Equals(qw2[0], 0u, "VIF0 should stall after the i-bit FLUSHE: the UNPACK waits");
+            t.Equals(mem.read32(0x10003800u) & 0x800u, 0x800u, "the stall shows as VIF0_STAT.INT");
+            mem.write32(0x10003810u, 0x8u); // FBRST.STC resumes the stream
+            std::memcpy(qw2, mem.getVU0Data() + 0x20u, sizeof(qw2));
             t.Equals(qw2[0], 11u, "codes after MSCAL should still run (the UNPACK's data from the next FIFO write)");
             t.Equals(qw2[3], 14u, "the whole UNPACK vector should land");
+        });
+
+        tc.Run("VIF0_STAT reads show the i-bit interrupt until FBRST.STC", [](TestCase &t)
+        {
+            // This Is Football polls VIF0_STAT bit 11 after each VIF0 packet (ended by FLUSHE + i).
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            t.Equals(mem.read32(0x10003800u) & 0x800u, 0u, "INT should start clear");
+            mem.write128(0x10004000u, _mm_setr_epi32(static_cast<int>(0x90000000u), 0, 0, 0));
+            t.Equals(mem.read32(0x10003800u) & 0x800u, 0x800u, "an i-bit VIFcode should set VIF0_STAT.INT");
+            mem.write32(0x10003810u, 0x8u);
+            t.Equals(mem.read32(0x10003800u) & 0x800u, 0u, "FBRST.STC should clear VIF0_STAT.INT");
+            mem.write128(0x10004000u, _mm_setr_epi32(static_cast<int>(makeVifCmd(0x07u, 0u, 0x1234u)), 0, 0, 0)); // MARK
+            t.Equals(mem.read32(0x10003830u), 0x1234u, "VIF0_MARK should read back the MARK code's value");
         });
 
         tc.Run("VIF1 DMA DIRECT forwards payload to GIF callback and clears channel", [](TestCase &t)

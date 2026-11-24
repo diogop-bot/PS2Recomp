@@ -1,4 +1,5 @@
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vif0_mscal.h"
 #include "runtime/ps2_dma_hook.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_ipu.h"
@@ -1592,6 +1593,40 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10003800u && address < 0x10003A00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+        // VIF0 registers live in vif0_regs, which the VIF0 interpreter updates (STAT.INT from an
+        // i bit, MARK). Reads come back from there (readIORegister).
+        switch (address)
+        {
+        case 0x10003810u:     // VIF0_FBRST
+        {
+            static const bool fbrstLog = std::getenv("PS2X_VIF0_LOG") != nullptr;
+            static std::atomic<int> fbrstLogged{0};
+            if (fbrstLog && fbrstLogged.fetch_add(1) < 60)
+                std::fprintf(stderr, "[vif0] FBRST 0x%X (STAT 0x%X)%c", value, vif0_regs.stat, 10);
+        }
+            if (value & 0x1u) // RST
+            {
+                std::memset(&vif0_regs, 0, sizeof(vif0_regs));
+                resetVif0Stream();
+            }
+            if (value & 0x8u) // STC: clear the stall and interrupt bits, then resume the stream
+            {
+                const bool wasStalled = (vif0_regs.stat & (1u << 11)) != 0u;
+                vif0_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
+                if (wasStalled)
+                    processVIF0Data(static_cast<const uint8_t *>(nullptr), 0u);
+            }
+            break;
+        case 0x10003820u:
+            vif0_regs.err = value & 0x7u;
+            break;
+        case 0x10003830u:
+            vif0_regs.mark = value & 0xFFFFu;
+            vif0_regs.stat &= ~(1u << 6); // clear MRK on CPU write
+            break;
+        default:
+            break;
+        }
         return true;
     }
 
@@ -2903,6 +2938,31 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 {
     if (address >= 0x10003000u && address < 0x10007000u)
         syncGsWorker("gif/vif registers");
+    if (address >= 0x10003800u && address < 0x10003A00u)
+    {
+        // VIF0 registers from vif0_regs. This Is Football polls VIF0_STAT.INT (bit 11, set by the
+        // FLUSHE+i that ends its VIF0 packets) at 0x2BD410; a read from the generic register map
+        // never saw it, and the match stalled whenever that poll ran.
+        switch (address)
+        {
+        case 0x10003800u: return vif0_regs.stat;
+        case 0x10003820u: return vif0_regs.err;
+        case 0x10003830u: return vif0_regs.mark;
+        case 0x10003840u: return vif0_regs.cycle;
+        case 0x10003850u: return vif0_regs.mode;
+        case 0x10003860u: return vif0_regs.num;
+        case 0x10003870u: return vif0_regs.mask;
+        case 0x10003880u: return vif0_regs.code;
+        case 0x10003890u: return vif0_regs.itops;
+        case 0x100038D0u: return vif0_regs.itop;
+        case 0x10003900u: case 0x10003910u: case 0x10003920u: case 0x10003930u:
+            return vif0_regs.row[(address - 0x10003900u) >> 4];
+        case 0x10003940u: case 0x10003950u: case 0x10003960u: case 0x10003970u:
+            return vif0_regs.col[(address - 0x10003940u) >> 4];
+        default:
+            return 0u;
+        }
+    }
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

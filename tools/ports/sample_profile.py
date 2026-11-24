@@ -11,6 +11,8 @@ The game is stopped at the end. With --pid, a running game is sampled instead an
 With --stacks, samples whose function matches REGEX also scan the thread's stack for return
 addresses into the game's exe, and the busiest threads list the most common chains of them.
 With --lines, samples in functions matching REGEX are also counted per source line.
+With --classify LABEL=REGEX,..., every sample is attributed to the first label whose regex matches
+its function or a return address on its stack (e.g. VU0=executeVU0Microprogram,VU1=syncCoreSubsystems).
 """
 import argparse
 import collections
@@ -125,6 +127,9 @@ def main():
     ap.add_argument('--pid', type=int, default=0)
     ap.add_argument('--stacks', default='')
     ap.add_argument('--lines', default='')
+    ap.add_argument('--classify', default='',
+                    help='LABEL=REGEX,...: label each sample of the busiest threads by the first label whose regex '
+                         'matches its function or any return address on its stack (else "other")')
     args = ap.parse_args()
 
     game = None
@@ -143,7 +148,7 @@ def main():
             if h:
                 handles[tid] = h
         exe_lo = exe_hi = 0
-        if args.stacks:
+        if args.stacks or args.classify:
             mods = (wt.HMODULE * 1)()
             needed = wt.DWORD()
             psapi.EnumProcessModules(proc, mods, ctypes.sizeof(mods), ctypes.byref(needed))
@@ -167,7 +172,7 @@ def main():
                 if k32.GetThreadContext(h, ctypes.c_void_p(ctx_addr)):
                     rip = ctypes.c_uint64.from_address(ctx_addr + RIP_OFFSET).value
                     samples[tid][rip] += 1
-                    if args.stacks:
+                    if args.stacks or args.classify:
                         rsp = ctypes.c_uint64.from_address(ctx_addr + RSP_OFFSET).value
                         got = ctypes.c_size_t()
                         size = STACK_SCAN_BYTES
@@ -223,6 +228,15 @@ def main():
                             lines['0x%x' % addr] += n
                 for where, n in lines.most_common(args.top):
                     print(f'    {100 * n / total:5.1f}%  [{args.lines}] {where}')
+            if args.classify:
+                rules = [(lbl, re.compile(rx)) for lbl, rx in (p.split('=', 1) for p in args.classify.split(','))]
+                labels = collections.Counter()
+                for rip, rets in stacks[tid]:
+                    names = [name(rip)] + [name(r) for r in rets]
+                    labels[next((lbl for lbl, rx in rules if any(rx.search(n) for n in names)), 'other')] += 1
+                n_all = sum(labels.values()) or 1
+                for lbl, n in labels.most_common():
+                    print(f'    {100 * n / n_all:5.1f}%  [classify] {lbl}')
             if args.stacks:
                 rx = re.compile(args.stacks)
                 chains = collections.Counter()

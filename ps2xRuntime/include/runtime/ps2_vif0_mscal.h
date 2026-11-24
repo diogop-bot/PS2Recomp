@@ -11,3 +11,7 @@
 using Vif0MscalHandler = std::function<void(uint32_t startPC, uint32_t itop)>;
 
 void setVif0MscalHandler(Vif0MscalHandler handler);
+
+// Drops the VIF0 stream kept for later (an incomplete VIFcode or the rest after an i-bit stall).
+// Called on VIF0_FBRST.RST.
+void resetVif0Stream();

@@ -735,8 +735,7 @@ bool PS2Runtime::syncCoreSubsystems()
                             R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                             if (!cpuContext)
                                 cpuContext = &m_cpuContext;
-                            // PS2X_VIF0_MSCAL=0 ignores VIF0 MSCAL (diagnostics: TIF then stops
-                            // presenting frames after match load, as it waits on the results).
+                            // PS2X_VIF0_MSCAL=0 ignores VIF0 MSCAL (A/B diagnostics only).
                             static const bool enabled = []
                             {
                                 const char *e = std::getenv("PS2X_VIF0_MSCAL");

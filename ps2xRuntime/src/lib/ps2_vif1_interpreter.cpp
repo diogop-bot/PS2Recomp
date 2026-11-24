@@ -168,6 +168,20 @@ namespace
     }
 }
 
+namespace
+{
+    // VIF0 stream kept for later (see processVIF0Data). VIF0 is driven from the EE thread only.
+    std::vector<uint8_t> s_vif0Carry;
+    std::vector<uint8_t> s_vif0Joined;
+}
+
+void resetVif0Stream()
+{
+    if (!s_vif0Carry.empty() && std::getenv("PS2X_VIF0_LOG"))
+        std::fprintf(stderr, "[vif0] FBRST.RST drops 0x%zX kept bytes%c", s_vif0Carry.size(), 10);
+    s_vif0Carry.clear();
+}
+
 void setVif0MscalHandler(Vif0MscalHandler handler)
 {
     s_vif0Mscal = std::move(handler);
@@ -188,17 +202,47 @@ void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
 {
     syncGsWorker("direct vif0");
-    if (sizeBytes == 0u)
-        return;
 
     // VIF0 is a stream: a VIFcode's payload may arrive in a later transfer. Games write the VIFcodes
     // of an UNPACK to the VIF0 FIFO (0x10004000) and send its data with a separate normal-mode DMA
     // (This Is Football's bone palette upload at 0x2B2340), or split an MPG across DMA tags. A code
     // whose payload is incomplete is kept here, with what has arrived of the payload, and finished
     // by the next FIFO write or DMA. VIF0 is only driven from the EE thread. The state is one
-    // static for the process (one PS2Memory in a game) and is not reset by VIF0 FBRST yet.
-    static std::vector<uint8_t> carry;
-    static std::vector<uint8_t> joined;
+    // static for the process (one PS2Memory in a game); VIF0_FBRST.RST drops it (resetVif0Stream).
+    //
+    // A VIFcode with the i bit stalls VIF0 after it completes: STAT.INT is set and the rest of the
+    // stream waits here until the EE writes FBRST.STC, which calls this with no data to resume.
+    // This Is Football sends a chain of packets each ending with FLUSHE + i, and between them reads
+    // the VU0 results (toSPR from 0x11004000) before STC; running the whole chain at once overwrote
+    // the results and left INT clear for its next poll at 0x2BD410, which then spun forever.
+    std::vector<uint8_t> &carry = s_vif0Carry;
+    std::vector<uint8_t> &joined = s_vif0Joined;
+    constexpr uint32_t kStatInt = 1u << 11;
+    static const bool streamLog = std::getenv("PS2X_VIF0_LOG") != nullptr;
+    if ((vif0_regs.stat & kStatInt) != 0u)
+    {
+        if (sizeBytes != 0u)
+        {
+            if (carry.size() + sizeBytes > (4u << 20))
+            {
+                std::fprintf(stderr, "[vif0] stalled (INT) with 0x%zX bytes kept: 0x%X more dropped%c", carry.size(), sizeBytes, 10);
+                return;
+            }
+            carry.insert(carry.end(), data, data + sizeBytes);
+            static std::atomic<int> queued{0};
+            if (streamLog && queued.fetch_add(1) < 40)
+                std::fprintf(stderr, "[vif0] stalled: 0x%X bytes queued (0x%zX kept)%c", sizeBytes, carry.size(), 10);
+        }
+        return;
+    }
+    if (sizeBytes == 0u && !carry.empty())
+    {
+        static std::atomic<int> resumes{0};
+        if (streamLog && resumes.fetch_add(1) < 40)
+            std::fprintf(stderr, "[vif0] resume after STC with 0x%zX bytes kept%c", carry.size(), 10);
+    }
+    if (sizeBytes == 0u && carry.empty())
+        return;
     if (!carry.empty())
     {
         joined.assign(carry.begin(), carry.end());
@@ -224,8 +268,19 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
     };
 
     uint32_t pos = 0;
+    bool stallAfterCommand = false;
     while (pos + 4 <= sizeBytes)
     {
+        if (stallAfterCommand)
+        {
+            // The previous code had the i bit: stall, keeping the rest for FBRST.STC.
+            vif0_regs.stat |= kStatInt;
+            carry.assign(data + pos, data + sizeBytes);
+            static std::atomic<int> stalls{0};
+            if (streamLog && stalls.fetch_add(1) < 40)
+                std::fprintf(stderr, "[vif0] i-bit stall: 0x%zX bytes kept for STC%c", carry.size(), 10);
+            return;
+        }
         const uint32_t cmdStart = pos;
         uint32_t cmd = 0u;
         std::memcpy(&cmd, data + pos, sizeof(cmd));
@@ -238,8 +293,8 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
 
         vif0_regs.code = cmd;
         vif0_regs.num = num;
-        if (irq)
-            vif0_regs.stat |= (1u << 11);
+        // An incomplete code returns before this takes effect; it stalls once it has run.
+        stallAfterCommand = irq;
 
         if (opcode == VIF_NOP)
         {
@@ -491,6 +546,8 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
             break;
         }
     }
+    if (stallAfterCommand)
+        vif0_regs.stat |= kStatInt;
 }
 
 namespace
